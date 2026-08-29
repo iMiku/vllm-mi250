@@ -310,6 +310,7 @@ class PleOffloadConnector:
         else:
             self._copy_cpu_inputs(request)
 
+        logger.info("PLE-DBG sent nt=%d", request.num_tokens)
         with torch.cuda.nvtx.range("ple_offload.send_request"):
             socket.send(msgspec.msgpack.encode(request))
 
@@ -406,6 +407,7 @@ class PleOffloadConnector:
         # the CPU result fan-out to every registered TP output buffer.
         if self.tp_rank != 0:
             return
+        logger.info("PLE-DBG launch nt=%d nreq=%d", num_tokens, num_reqs)
 
         if self._uses_cuda_inputs:
             assert self._input_ready_event is not None
@@ -426,6 +428,7 @@ class PleOffloadConnector:
         dummy_run: bool,
     ) -> None:
         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
+        logger.info("PLE-DBG prepare nt=%d dummy=%s", num_tokens, dummy_run)
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return

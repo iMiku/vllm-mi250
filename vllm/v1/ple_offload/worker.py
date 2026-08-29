@@ -613,6 +613,11 @@ class PleOffloadRunner:
 
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
         """Run requests layer-first so each DP rank can resume promptly."""
+        logger.info(
+            "PLE-DBG worker recv n=%d dps=%s",
+            len(requests),
+            [r.dp_rank for r in requests],
+        )
         requests_by_dp: dict[int, PleOffloadRequest] = {}
         for request in requests:
             if request.dp_rank not in self._worker_targets:
@@ -671,3 +676,4 @@ class PleOffloadRunner:
                             result[slices], non_blocking=True
                         )
                         target.sem.signal(target.copy_stream)
+                logger.info("PLE-DBG worker signaled layer=%s", layer_name)

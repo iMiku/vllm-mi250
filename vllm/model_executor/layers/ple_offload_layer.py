@@ -323,11 +323,13 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
+            print("PLE-DBG gpu wait enter", flush=True)
             torch.ops.vllm.ple_offload_wait(
                 self._sem.flag_tensor,
                 self._gpu_output_buffer,
                 hidden_states,
             )
+            print("PLE-DBG gpu wait done", flush=True)
             return self._gpu_output_buffer[: input_ids.shape[0]]
         return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
 
