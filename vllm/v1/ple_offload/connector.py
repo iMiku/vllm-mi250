@@ -416,9 +416,7 @@ class PleOffloadConnector:
             # The background copy stream waits for runner input production
             # without making the model stream wait for D2H completion.
             self._input_ready_event.record(torch.cuda.current_stream(self.device))
-        seqs = {
-            name: self._bump_seq(name) for name in self._layers
-        }
+        seqs = dict(self._layer_seq)
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
