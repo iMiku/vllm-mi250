@@ -44,12 +44,17 @@ elif current_platform.is_rocm():
 
     compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
     try:
-        if on_gfx1250():
+        try:
+            # gfx90a and other pre-gfx1250 ROCm parts have no upstream
+            # flash-attn wheel, but aiter ships a working triton
+            # flash_attn_varlen_func for them.
             from aiter.ops.triton.mha import (  # type: ignore[no-redef]
                 flash_attn_varlen_func,
             )
-        else:
-            from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        except ImportError:
+            from flash_attn import (  # type: ignore[no-redef]
+                flash_attn_varlen_func,
+            )
 
         _ROCM_FLASH_ATTN_AVAILABLE = True
     except ImportError:

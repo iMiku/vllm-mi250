@@ -105,7 +105,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if not is_flash_attn_varlen_func_available():
-            raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
+            # gfx90a: upstream flash-attn is unavailable, but aiter ships a
+            # working triton flash_attn_varlen_func; allow QSA when present.
+            # The QSA kernels themselves are self-contained Triton.
+            try:
+                from aiter.ops.triton.mha import (  # noqa: F401
+                    flash_attn_varlen_func,
+                )
+            except ImportError:
+                raise NotImplementedError(
+                    "Qwen4Exp QSA requires FlashAttention"
+                )
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
