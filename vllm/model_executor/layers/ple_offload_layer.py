@@ -23,9 +23,33 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import torch
-from cuda.bindings import driver as cuda_driver
-from cuda.bindings.driver import CUstreamWaitValue_flags
 from torch import nn
+
+from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    # gfx90a: HIP exposes the same stream memory-ops via libamdhip64.so.
+    # Flag values follow the HIP header: hipStreamWaitValue_eq = 0x2.
+    import ctypes
+
+    _hip = ctypes.CDLL("libamdhip64.so")
+    _HIP_STREAM_WAIT_VALUE_EQ = 0x2
+    _hip.hipStreamWriteValue32.restype = ctypes.c_int
+    _hip.hipStreamWriteValue32.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+    ]
+    _hip.hipStreamWaitValue32.restype = ctypes.c_int
+    _hip.hipStreamWaitValue32.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_uint,
+    ]
+
+    def _hip_check(rc: int, operation: str) -> None:
+        if rc != 0:
+            raise RuntimeError(f"{operation} failed: hipError_t={rc}")
+else:
+    from cuda.bindings import driver as cuda_driver
+    from cuda.bindings.driver import CUstreamWaitValue_flags
 
 import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -87,6 +111,17 @@ class CpuGpuSemaphore:
         """Enqueue ``WriteValue32(flag=0)`` on ``stream``."""
         if stream is None:
             stream = torch.cuda.current_stream()
+        if current_platform.is_rocm():
+            _hip_check(
+                _hip.hipStreamWriteValue32(
+                    stream.cuda_stream,
+                    self._flag_tensor.data_ptr(),
+                    self.RESET_VALUE,
+                    0,
+                ),
+                "CpuGpuSemaphore.reset",
+            )
+            return
         _cuda_check(
             cuda_driver.cuStreamWriteValue32(
                 cuda_driver.CUstream(stream.cuda_stream),
@@ -101,6 +136,17 @@ class CpuGpuSemaphore:
         """Enqueue ``WriteValue32(flag=1)`` on ``stream``."""
         if stream is None:
             stream = torch.cuda.current_stream()
+        if current_platform.is_rocm():
+            _hip_check(
+                _hip.hipStreamWriteValue32(
+                    stream.cuda_stream,
+                    self._flag_tensor.data_ptr(),
+                    self.DONE_VALUE,
+                    0,
+                ),
+                "CpuGpuSemaphore.signal",
+            )
+            return
         _cuda_check(
             cuda_driver.cuStreamWriteValue32(
                 cuda_driver.CUstream(stream.cuda_stream),
@@ -115,6 +161,18 @@ class CpuGpuSemaphore:
         """Enqueue ``WaitValue32(flag==0)`` on ``stream``."""
         if stream is None:
             stream = torch.cuda.current_stream()
+        if current_platform.is_rocm():
+            _hip_check(
+                _hip.hipStreamWaitValue32(
+                    stream.cuda_stream,
+                    self._flag_tensor.data_ptr(),
+                    self.RESET_VALUE,
+                    _HIP_STREAM_WAIT_VALUE_EQ,
+                    0xFFFFFFFF,
+                ),
+                "CpuGpuSemaphore.wait_reset",
+            )
+            return
         _cuda_check(
             cuda_driver.cuStreamWaitValue32(
                 cuda_driver.CUstream(stream.cuda_stream),

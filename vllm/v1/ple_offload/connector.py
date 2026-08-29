@@ -12,7 +12,14 @@ import msgspec
 import torch
 import torch.nn as nn
 import zmq
-from cuda.bindings import driver as cuda_driver
+from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    import ctypes
+
+    from vllm.model_executor.layers.ple_offload_layer import _hip
+else:
+    from cuda.bindings import driver as cuda_driver
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
@@ -170,14 +177,27 @@ class PleOffloadConnector:
                 raise RuntimeError("PLE input buffers must be shared CPU tensors")
             if not buffer.is_contiguous():
                 raise RuntimeError("PLE input buffers must be contiguous")
-            _cuda_check(
-                cuda_driver.cuMemHostRegister(
-                    buffer.data_ptr(),
-                    buffer.numel() * buffer.element_size(),
-                    cuda_driver.CU_MEMHOSTREGISTER_PORTABLE,
-                ),
-                "cuMemHostRegister(PLE input buffer)",
-            )
+            if current_platform.is_rocm():
+                import ctypes
+
+                rc = _hip.hipHostRegister(
+                    ctypes.c_void_p(buffer.data_ptr()),
+                    ctypes.c_size_t(buffer.numel() * buffer.element_size()),
+                    ctypes.c_uint(0x01),  # hipHostRegisterPortable
+                )
+                if rc != 0:
+                    raise RuntimeError(
+                        f"hipHostRegister(PLE input buffer) failed: {rc}"
+                    )
+            else:
+                _cuda_check(
+                    cuda_driver.cuMemHostRegister(
+                        buffer.data_ptr(),
+                        buffer.numel() * buffer.element_size(),
+                        cuda_driver.CU_MEMHOSTREGISTER_PORTABLE,
+                    ),
+                    "cuMemHostRegister(PLE input buffer)",
+                )
             self._pinned_input_buffers.append(buffer)
             if not buffer.is_pinned():
                 raise RuntimeError("CUDA did not page-lock a PLE input buffer")
@@ -186,10 +206,19 @@ class PleOffloadConnector:
         """Release CUDA registrations after the request thread has stopped."""
         for buffer in reversed(self._pinned_input_buffers):
             try:
-                _cuda_check(
-                    cuda_driver.cuMemHostUnregister(buffer.data_ptr()),
-                    "cuMemHostUnregister(PLE input buffer)",
-                )
+                if current_platform.is_rocm():
+                    import ctypes
+
+                    rc = _hip.hipHostUnregister(ctypes.c_void_p(buffer.data_ptr()))
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"hipHostUnregister(PLE input buffer) failed: {rc}"
+                        )
+                else:
+                    _cuda_check(
+                        cuda_driver.cuMemHostUnregister(buffer.data_ptr()),
+                        "cuMemHostUnregister(PLE input buffer)",
+                    )
             except RuntimeError:
                 logger.exception("Failed to unregister a PLE input buffer")
         self._pinned_input_buffers.clear()

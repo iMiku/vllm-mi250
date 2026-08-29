@@ -25,6 +25,10 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -123,7 +127,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -248,12 +252,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def forward_impl(  # type: ignore[override]
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        del hidden_states
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1
@@ -269,15 +275,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"at most {self.padded_buffer.shape[0]}"
             )
 
+        # The CPU-offload subprocess is never captured by a CUDA Graph, so its
+        # pack workspace can narrow to the actual maximum sequence length. The
+        # regular GPU path retains the static maximum-width buffer for capture.
+        if is_offload_process():
+            if num_reqs <= 0:
+                raise ValueError("PLE CPU offload requires at least one request")
+            max_seq_len = max(
+                1,
+                int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+            )
+            # The model runner sends the CUDA-graph padded token count together
+            # with an unpadded query_start_loc. Stale padding must not enter the
+            # scatter: its clamped indices would overwrite the last real token.
+            num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+        else:
+            max_seq_len = self.padded_buffer.shape[1]
+            num_valid_tokens = num_tokens
+
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
+        packed = self.padded_buffer[:num_reqs, :max_seq_len]
         packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        packed[request_indices, columns] = input_ids
+        packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+            input_ids[:num_valid_tokens]
+        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
@@ -312,6 +338,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
+        if output_buffer is not None:
+            output = output_buffer[:num_tokens, : self.embedding_dim]
+            torch.index_select(
+                self.ngram_embedding.weight,
+                0,
+                ngram_ids.reshape(-1),
+                out=output.reshape(-1, self.head_dim),
+            )
+            return output
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.ngram_embedding.params_dtype,
@@ -422,15 +457,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
-            config,
-            int(config.ple_embed_dim),
-            self.ple_dense_layer_id,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.scheduler_config.max_num_seqs,
-            f"{prefix}.ple_embedding",
-            prefix,
-        )
+        with torch.device(PleOffloadLayer.get_target_device()):
+            ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_dense_layer_id,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.scheduler_config.max_num_seqs,
+                f"{prefix}.ple_embedding",
+                prefix,
+            )
+        self.ple_embedding: nn.Module = ple_embedding
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -1014,7 +1051,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states, input_ids, query_start_loc, ngram_context
+        )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
