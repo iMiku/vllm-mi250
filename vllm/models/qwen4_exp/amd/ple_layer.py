@@ -29,6 +29,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
     is_offload_process,
 )
+import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -360,6 +361,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        # GPU workers own no PLE weights in offload mode; the CPU offload
+        # process loads the embedding table and hash buffers instead.
+        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            return set()
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
