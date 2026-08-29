@@ -201,6 +201,18 @@ def _ple_offload_wait_impl(
 ) -> None:
     """Wait for the CPU result without releasing its output buffer."""
     stream = torch.cuda.current_stream()
+    if current_platform.is_rocm():
+        _hip_check(
+            _hip.hipStreamWaitValue32(
+                stream.cuda_stream,
+                sem_flag_tensor.data_ptr(),
+                CpuGpuSemaphore.DONE_VALUE,
+                _HIP_STREAM_WAIT_VALUE_EQ,
+                0xFFFFFFFF,
+            ),
+            "hipStreamWaitValue32(done)",
+        )
+        return
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
     _cuda_check(
