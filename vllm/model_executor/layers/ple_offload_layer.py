@@ -267,7 +267,7 @@ def _ple_offload_wait_fake(
 direct_register_custom_op(
     op_name="ple_offload_wait",
     op_func=_ple_offload_wait_impl,
-    mutates_args=["gpu_output_buffer"],
+    mutates_args=set(),
     fake_impl=_ple_offload_wait_fake,
 )
 
