@@ -150,7 +150,7 @@ def is_aiter_found_and_supported() -> bool:
     if current_platform.is_rocm() and IS_AITER_FOUND:
         from vllm.platforms.rocm import get_cdna_version
 
-        return get_cdna_version() > 2
+        return get_cdna_version() >= 2  # gfx90a (CDNA2) allowed: tuned AR kernels
     return False
 
 
