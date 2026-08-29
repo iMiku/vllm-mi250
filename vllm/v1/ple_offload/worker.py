@@ -618,6 +618,7 @@ class PleOffloadRunner:
             len(requests),
             [r.dp_rank for r in requests],
         )
+
         requests_by_dp: dict[int, PleOffloadRequest] = {}
         for request in requests:
             if request.dp_rank not in self._worker_targets:
@@ -646,12 +647,10 @@ class PleOffloadRunner:
             for dp_rank, request in requests_by_dp.items():
                 targets = self._worker_targets[dp_rank][layer_name]
 
-                # The CPU must not overwrite a GPU output buffer until its
-                # previous result has been consumed. The GPU runner resets the
-                # flag after the complete model forward.
-                for target in targets:
-                    target.copy_stream.synchronize()
-                    target.sem.wait_reset(target.copy_stream)
+                # Monotonic sequencing: the GPU waits for flag >= N before
+                # reading slot N%2; requests are handled serially, so slot
+                # (N-1)%2 -- the only one the GPU could still be reading --
+                # is never touched here. No reset/wait handshake needed.
 
                 input_bufs = self._input_bufs[dp_rank]
                 ngram_context = (
@@ -675,5 +674,11 @@ class PleOffloadRunner:
                         target.gpu_output_buffer[slices].copy_(
                             result[slices], non_blocking=True
                         )
-                        target.sem.signal(target.copy_stream)
-                logger.info("PLE-DBG worker signaled layer=%s", layer_name)
+                        target.sem.signal_value(
+                            target.copy_stream, request.seqs[layer_name]
+                        )
+                logger.info(
+                    "PLE-DBG worker signaled layer=%s seq=%d",
+                    layer_name,
+                    request.seqs[layer_name],
+                )

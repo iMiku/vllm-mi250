@@ -132,6 +132,35 @@ class CpuGpuSemaphore:
             "CpuGpuSemaphore.reset",
         )
 
+    def signal_value(
+        self,
+        stream: torch.cuda.Stream | None = None,
+        value: int = 1,
+    ) -> None:
+        """Monotonic write: enqueue ``flag = value`` (value must increase)."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        if current_platform.is_rocm():
+            _hip_check(
+                _hip.hipStreamWriteValue32(
+                    stream.cuda_stream,
+                    self._flag_tensor.data_ptr(),
+                    value,
+                    0,
+                ),
+                "CpuGpuSemaphore.signal_value",
+            )
+            return
+        _cuda_check(
+            cuda_driver.cuStreamWriteValue32(
+                cuda_driver.CUstream(stream.cuda_stream),
+                cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
+                value,
+                0,
+            ),
+            "CpuGpuSemaphore.signal_value",
+        )
+
     def signal(self, stream: torch.cuda.Stream | None = None) -> None:
         """Enqueue ``WriteValue32(flag=1)`` on ``stream``."""
         if stream is None:
@@ -196,21 +225,21 @@ class CpuGpuSemaphore:
 
 def _ple_offload_wait_impl(
     sem_flag_tensor: torch.Tensor,
-    gpu_output_buffer: torch.Tensor,
+    expected_seq: int,
     hidden_states: torch.Tensor,
 ) -> None:
-    """Wait for the CPU result without releasing its output buffer."""
+    """Wait (device-side, GTE) until the offload process finishes `expected_seq`."""
     stream = torch.cuda.current_stream()
     if current_platform.is_rocm():
         _hip_check(
             _hip.hipStreamWaitValue32(
                 stream.cuda_stream,
                 sem_flag_tensor.data_ptr(),
-                CpuGpuSemaphore.DONE_VALUE,
-                _HIP_STREAM_WAIT_VALUE_EQ,
+                ctypes.c_int(expected_seq),
+                0x1,  # hipStreamWaitValue_gte
                 0xFFFFFFFF,
             ),
-            "hipStreamWaitValue32(done)",
+            "hipStreamWaitValue32(gte)",
         )
         return
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
@@ -219,16 +248,16 @@ def _ple_offload_wait_impl(
         cuda_driver.cuStreamWaitValue32(
             cuda_stream,
             dev_ptr,
-            CpuGpuSemaphore.DONE_VALUE,
-            CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            expected_seq,
+            CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GTE.value,
         ),
-        "cuStreamWaitValue32(done)",
+        "cuStreamWaitValue32(gte)",
     )
 
 
 def _ple_offload_wait_fake(
     sem_flag_tensor: torch.Tensor,
-    gpu_output_buffer: torch.Tensor,
+    expected_seq: int,
     hidden_states: torch.Tensor,
 ) -> None:
     """Represent the side-effect-only wait during dynamo tracing."""
@@ -309,10 +338,17 @@ class PleOffloadLayer(nn.Module, ABC):
         gpu_output_buffer: torch.Tensor,
         semaphore: CpuGpuSemaphore,
     ) -> None:
-        """Configure the GPU-worker placeholder with its IPC resources."""
+        """Configure the GPU-worker placeholder with its IPC resources.
+
+        gpu_output_buffer has two slots (seq % 2); the flag is a monotonic
+        sequence counter written by the offload process after filling slot
+        (seq-1) % 2. The GPU waits for flag >= seq (GTE) -- no reset, so a
+        slow consumer can never lose a wakeup.
+        """
         self._is_cpu_offloaded = True
         self._gpu_output_buffer = gpu_output_buffer
         self._sem = semaphore
+        self._ple_seq = 0
 
     def forward(
         self,
@@ -323,20 +359,19 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            print("PLE-DBG gpu wait enter", flush=True)
+            self._ple_seq += 1
+            seq = self._ple_seq
             torch.ops.vllm.ple_offload_wait(
                 self._sem.flag_tensor,
-                self._gpu_output_buffer,
+                seq,
                 hidden_states,
             )
-            print("PLE-DBG gpu wait done", flush=True)
-            return self._gpu_output_buffer[: input_ids.shape[0]]
+            return self._gpu_output_buffer[(seq - 1) % 2, : input_ids.shape[0]]
         return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
 
     def release_offloaded_output(
         self,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        """Mark the cross-process output buffer reusable on ``stream``."""
-        if self._is_cpu_offloaded:
-            self._sem.reset(stream)
+        """No-op: monotonic sequencing needs no flag reset."""
+        del stream

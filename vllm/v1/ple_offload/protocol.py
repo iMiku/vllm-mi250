@@ -35,6 +35,9 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Per-layer monotonic sequence numbers assigned by the GPU connector.
+    # The CPU worker writes flag[layer] = seq after filling slot (seq-1)%2.
+    seqs: dict[str, int] = msgspec.field(default_factory=dict)
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)

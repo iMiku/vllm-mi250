@@ -156,6 +156,7 @@ class PleOffloadConnector:
             # The CPU worker writes results here through CUDA IPC. The GPU
             # placeholder waits on the paired cross-process semaphore.
             output_buffer = torch.empty(
+                2,
                 max_num_tokens,
                 layer.get_offload_output_dim(int(config.ple_embed_dim)),
                 dtype=layer.get_offload_output_dtype(vllm_config.model_config.dtype),
@@ -165,6 +166,7 @@ class PleOffloadConnector:
                 output_buffer,
                 CpuGpuSemaphore(self.device),
             )
+        self._layer_seq: dict[str, int] = {}
         return layers
 
     def _pin_input_buffers(self) -> None:
@@ -414,12 +416,21 @@ class PleOffloadConnector:
             # The background copy stream waits for runner input production
             # without making the model stream wait for D2H completion.
             self._input_ready_event.record(torch.cuda.current_stream(self.device))
+        seqs = {
+            name: self._bump_seq(name) for name in self._layers
+        }
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            seqs=seqs,
         )
         self._request_queue.put_nowait(request)
+
+    def _bump_all_seqs(self) -> None:
+        """Advance every layer's monotonic sequence counter by one."""
+        for name in self._layers:
+            self._layer_seq[name] = self._layer_seq.get(name, 0) + 1
 
     def prepare_forward(
         self,
@@ -432,16 +443,22 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        self._bump_all_seqs()
         self._launch(num_reqs, num_tokens)
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
-        """Locally satisfy PLE waits for dummy and capture forwards."""
-        # Dummy and capture forwards do not send CPU requests, but every PLE
-        # placeholder still waits for a completed output semaphore.
+        """Locally satisfy PLE waits for dummy and capture forwards.
+
+        Monotonic protocol: advance each layer's sequence counter, zero its
+        output slot, and enqueue the counter write on the model stream so the
+        device-side GTE wait observes it in stream order.
+        """
+        self._bump_all_seqs()
         stream = torch.cuda.current_stream(self.device)
-        for layer in self._layers.values():
-            layer._gpu_output_buffer[:num_tokens].zero_()
-            layer._sem.signal(stream)
+        for name, layer in self._layers.items():
+            seq = self._layer_seq[name]
+            layer._gpu_output_buffer[(seq - 1) % 2, :num_tokens].zero_()
+            layer._sem.signal_value(stream, seq)
 
     def release_outputs(self) -> None:
         """Mark GPU output buffers reusable after the model consumes them."""
