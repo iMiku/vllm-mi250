@@ -363,8 +363,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         """Load hash buffers and checkpoint-split embedding rows."""
 
         # GPU workers own no PLE weights in offload mode; the CPU offload
-        # process loads the embedding table and hash buffers instead.
+        # process loads the embedding table and hash buffers instead. Drain
+        # the iterator so the loader's navigation sees no leftover keys.
         if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            for _ in weights:
+                pass
             return set()
 
         persistent_buffers = {
