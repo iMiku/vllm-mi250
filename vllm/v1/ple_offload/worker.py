@@ -668,15 +668,14 @@ class PleOffloadRunner:
 
                 # The result is identical on every TP rank in this DP group.
                 # Each copy stream signals only after its DMA completes.
-                slices = tuple(slice(0, size) for size in result.shape)
+                seq = request.seqs[layer_name]
+                slot = (seq - 1) % 2
                 for target in targets:
                     with torch.cuda.stream(target.copy_stream):
-                        target.gpu_output_buffer[slices].copy_(
-                            result[slices], non_blocking=True
+                        target.gpu_output_buffer[slot, : result.shape[0]].copy_(
+                            result, non_blocking=True
                         )
-                        target.sem.signal_value(
-                            target.copy_stream, request.seqs[layer_name]
-                        )
+                        target.sem.signal_value(target.copy_stream, seq)
                 logger.info(
                     "PLE-DBG worker signaled layer=%s seq=%d",
                     layer_name,
