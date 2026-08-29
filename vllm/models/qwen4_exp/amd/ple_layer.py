@@ -259,6 +259,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del hidden_states
         input_ids = input_ids.reshape(-1).long()
