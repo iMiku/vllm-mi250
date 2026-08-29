@@ -246,7 +246,7 @@ class Worker(WorkerBase):
         """Reject unsupported PLE offload execution modes."""
         parallel_config = self.parallel_config
         unsupported = []
-        if not current_platform.is_cuda():
+        if not (current_platform.is_cuda() or current_platform.is_rocm()):
             unsupported.append(f"device={current_platform.device_type}")
         if parallel_config.nnodes != 1:
             unsupported.append(f"nnodes={parallel_config.nnodes}")
