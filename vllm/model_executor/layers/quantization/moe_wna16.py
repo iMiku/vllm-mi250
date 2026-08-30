@@ -259,7 +259,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
         while intermediate_size_per_partition % group_size or hidden_size % group_size:
             group_size = group_size // 2
             group_size_div_factor *= 2
-            assert group_size >= 32
+            assert group_size >= 16
         layer.group_size = group_size
         layer.group_size_div_factor = group_size_div_factor
 

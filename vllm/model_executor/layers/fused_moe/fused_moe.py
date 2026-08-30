@@ -233,7 +233,12 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        # gfx90a TP8 W4A16: K may be smaller than BLOCK_SIZE_K (w2 K=80 < BK=128);
+        # the unmasked load then reads OOB -> illegal memory access under graph capture.
+        if not block_k_diviable:
+            b = tl.load(b_ptrs, mask=k_mask, other=0.0)
+        else:
+            b = tl.load(b_ptrs)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
