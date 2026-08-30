@@ -6,14 +6,12 @@ import gc
 import json
 import os
 import time
-from contextlib import nullcontext
 from datetime import datetime
 from itertools import product
 from typing import Any, TypedDict
 
-import ray
 import torch
-from ray.experimental.tqdm_ray import tqdm
+from tqdm import tqdm
 
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -177,8 +175,11 @@ def benchmark_config(
             (num_experts, shard_intermediate_size, hidden_size // group_size),
             dtype=dtype,
         )
+        # TP8 w2 of Flash-Next has K=80 < group_size=128 -> zero scales;
+        # pad to 1 so the kernel's scale indexing stays valid during tuning.
+        w2_num_k = max(1, intermediate_size // group_size)
         w2_scale = torch.rand(
-            (num_experts, hidden_size, intermediate_size // group_size),
+            (num_experts, hidden_size, w2_num_k),
             dtype=dtype,
         )
     elif use_int8_w8a16:
@@ -352,9 +353,9 @@ def get_rocm_tuning_space(use_fp16):
         "GROUP_SIZE_M": group_m_range,
         "num_warps": num_warps_range,
         "num_stages": num_stage_range,
-        "waves_per_eu": waves_per_eu_range,
     }
     if use_fp16:
+        param_ranges["waves_per_eu"] = waves_per_eu_range
         param_ranges["matrix_instr_nonkdim"] = matrix_instr_nonkdim_range
         param_ranges["kpack"] = kpack_range
 
@@ -397,6 +398,9 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
     # k_start // group_k), so a tile narrower than the block (e.g. N=64 with
     # block_n=128) is valid -- and often faster at small batch. An exact
     # multiple was required before, which dropped those smaller tiles entirely.
+    # For int4_w4a16 the gptq_awq kernel handles arbitrary BLOCK_SIZE_K via the
+    # block_k_diviable mask (see fused_moe_kernel_gptq_awq b-load), so we do
+    # not filter on block_k for w4a16 (tuner main() passes None).
     if block_quant_shape is not None and not use_fp16:
         block_n, block_k = block_quant_shape[0], block_quant_shape[1]
         for config in configs[:]:
@@ -413,11 +417,13 @@ def prune_rocm_search_space(
 ):
     N1, K1 = shard_intermediate_size, hidden_size
     N2, K2 = hidden_size, shard_intermediate_size // 2
+    # w2 (down-proj) has K=80 at TP8 for the Flash-Next 640/8=80 intermediate
+    # shape; allow BLOCK_SIZE_K > K there (masked b-load handles it).
     pruned_space_1 = prune_rocm_configs(
-        num_tokens * topk, N1, K1, search_space, is_fp16
+        num_tokens * topk, N1, K1, search_space, is_fp16, allow_k_misaligned=True
     )
     pruned_space_2 = prune_rocm_configs(
-        num_tokens * topk, N2, K2, search_space, is_fp16
+        num_tokens * topk, N2, K2, search_space, is_fp16, allow_k_misaligned=True
     )
     search_space = merge_unique_dicts(pruned_space_1, pruned_space_2)
     return search_space
@@ -425,7 +431,7 @@ def prune_rocm_search_space(
 
 # The following code is inspired by ROCm/Triton GEMM tuning script:
 # https://github.com/ROCm/triton/blob/triton-mlir/scripts/amd/gemm/tune_gemm.py#L89
-def prune_rocm_configs(M, N, K, configs, is_fp16=True):
+def prune_rocm_configs(M, N, K, configs, is_fp16=True, allow_k_misaligned=False):
     pruned_configs = []
     elemBytes_a = 2 if is_fp16 else 1
     elemBytes_b = 2 if is_fp16 else 1
@@ -477,7 +483,7 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
         # skip split_k that leads to EVEN_K = false
         leap = SPLIT_K * BLOCK_SIZE_K
         modv = K % leap
-        if modv != 0:
+        if modv != 0 and not allow_k_misaligned:
             continue
         # skip large GROUP_M
         if GROUP_M * BLOCK_SIZE_M > M and GROUP_M != 1:
@@ -519,16 +525,15 @@ def merge_unique_dicts(list1, list2):
     return result
 
 
-@ray.remote(num_gpus=1)
 class BenchmarkWorker:
     def __init__(self, seed: int) -> None:
         torch.set_default_device("cuda")
         set_random_seed(seed)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU. This is required for Ray to work
-        # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # Device to run the kernel on. With Ray this is set by ray.get_gpu_ids();
+        # in the standalone (no-ray) fallback we run sequentially over
+        # available devices via torch.cuda.device windows.
+        self.device_id = 0
 
     def benchmark(
         self,
@@ -620,49 +625,42 @@ class BenchmarkWorker:
                 topk,
             )
 
-        need_device_guard = False
-        if current_platform.is_rocm():
-            visible_device = os.environ.get("ROCR_VISIBLE_DEVICES", None)
-            if visible_device != f"{self.device_id}":
-                need_device_guard = True
+        # The device context is established by the caller (standalone mode) or
+        # by Ray (one worker per GPU). benchmark_config allocates on the
+        # current device; no extra guard needed here.
+        for idx, config in enumerate(tqdm(search_space)):
+            try:
+                kernel_time = benchmark_config(
+                    config,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    num_iters=20,
+                    block_quant_shape=block_quant_shape,
+                    use_deep_gemm=use_deep_gemm,
+                )
+            except triton.runtime.autotuner.OutOfResources:
+                # Some configurations may be invalid and fail to compile.
+                continue
 
-        with (
-            # Ray restricts each worker to one GPU; use local index 0
-            torch.accelerator.device_index(0) if need_device_guard else nullcontext()
-        ):
-            for idx, config in enumerate(tqdm(search_space)):
-                try:
-                    kernel_time = benchmark_config(
-                        config,
-                        num_tokens,
-                        num_experts,
-                        shard_intermediate_size,
-                        hidden_size,
-                        topk,
-                        dtype,
-                        use_fp8_w8a8,
-                        use_int8_w8a16,
-                        use_int4_w4a16,
-                        num_iters=20,
-                        block_quant_shape=block_quant_shape,
-                        use_deep_gemm=use_deep_gemm,
-                    )
-                except triton.runtime.autotuner.OutOfResources:
-                    # Some configurations may be invalid and fail to compile.
-                    continue
+            if kernel_time < best_time:
+                best_time = kernel_time
+                best_config = config
 
-                if kernel_time < best_time:
-                    best_time = kernel_time
-                    best_config = config
-
-                # Periodically clear Triton JIT cache to prevent OOM
-                # This is especially important for large models with many experts
-                if (
-                    TRITON_CACHE_CLEAR_INTERVAL > 0
-                    and idx > 0
-                    and idx % TRITON_CACHE_CLEAR_INTERVAL == 0
-                ):
-                    clear_triton_cache()
+            # Periodically clear Triton JIT cache to prevent OOM
+            # This is especially important for large models with many experts
+            if (
+                TRITON_CACHE_CLEAR_INTERVAL > 0
+                and idx > 0
+                and idx % TRITON_CACHE_CLEAR_INTERVAL == 0
+            ):
+                clear_triton_cache()
 
         # Final cleanup after tuning completes
         clear_triton_cache()
@@ -674,11 +672,15 @@ class BenchmarkWorker:
 
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
+    # All Triton MoE kernels (incl. gptq_awq) take SPLIT_K as a required
+    # constexpr. The rocm search space fixes SPLIT_K=1 for int4_w4a16 (see
+    # main()); keep it in the saved JSON so production `**config` works.
     return {
         "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
         "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
         "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
         "GROUP_SIZE_M": config["GROUP_SIZE_M"],
+        "SPLIT_K": 1,
         "num_warps": config["num_warps"],
         "num_stages": config["num_stages"],
         **(
@@ -792,6 +794,12 @@ def get_model_params(config):
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeTextConfig",
     ):
+        text_config = config.get_text_config()
+        E = text_config.num_experts
+        topk = text_config.num_experts_per_tok
+        intermediate_size = text_config.moe_intermediate_size
+        hidden_size = text_config.hidden_size
+    elif architecture == "Qwen4ExpForConditionalGeneration":
         text_config = config.get_text_config()
         E = text_config.num_experts
         topk = text_config.num_experts_per_tok
@@ -950,18 +958,16 @@ def main(args: argparse.Namespace):
     use_deep_gemm = bool(args.use_deep_gemm)
 
     if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
-        # Ray will set ROCR_VISIBLE_DEVICES for device visibility
-        logger.warning(
-            "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
-            "Replacing HIP_VISIBLE_DEVICES with ROCR_VISIBLE_DEVICES."
-        )
         val = os.environ["HIP_VISIBLE_DEVICES"]
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
+    # Standalone mode (no Ray): run each batch sequentially on the first
+    # visible device. 8-GPU parallelism used to come from Ray workers but is
+    # not available in this env; single-device tuning is sufficient and far
+    # more robust (no triton JIT cache contention across processes).
+    num_gpus = 1
+    workers = [BenchmarkWorker(args.seed)]
 
     def _distribute(method: str, inputs: list[Any]) -> list[Any]:
         outputs = []
@@ -969,10 +975,10 @@ def main(args: argparse.Namespace):
         for input_args in inputs:
             worker = workers[worker_idx]
             worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
+            with torch.cuda.device(worker.device_id):
+                outputs.append(worker_method(*input_args))
             worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+        return outputs
 
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
