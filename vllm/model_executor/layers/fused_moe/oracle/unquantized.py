@@ -333,6 +333,31 @@ def convert_to_unquantized_kernel_format(
     w2_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if unquantized_backend == UnquantizedMoeBackend.AITER:
+        # gfx90a: aiter shuffle_weight requires the innermost dim to be a
+        # multiple of 32 (BK = IK*2 for bf16). TP sharding can split the MoE
+        # intermediate dimension to values like 80 (640/8), which fails the
+        # assert. Pad w2's K (intermediate) and each w1/w3 half of w13's N to
+        # the next multiple of 32; zero rows contribute nothing to the GEMM.
+        k = w2_weight.shape[-1]
+        if k % 32 != 0:
+            kp = ((k + 31) // 32) * 32
+            w2_pad = torch.zeros(
+                (*w2_weight.shape[:-1], kp),
+                device=w2_weight.device,
+                dtype=w2_weight.dtype,
+            )
+            w2_pad[..., :k] = w2_weight
+            w2_weight = w2_pad
+            e, n, h = w13_weight.shape
+            w13_pad = torch.zeros(
+                (e, 2 * kp, h), device=w13_weight.device, dtype=w13_weight.dtype
+            )
+            half = n // 2
+            # w1 (gate) rows keep their leading position; w3 (up) rows move
+            # to the second padded half; trailing rows of each half stay 0.
+            w13_pad[:, :half, :] = w13_weight[:, :half, :]
+            w13_pad[:, kp:kp + half, :] = w13_weight[:, half:, :]
+            w13_weight = w13_pad
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
         w13_weight.is_shuffled = True
         w2_weight.is_shuffled = True

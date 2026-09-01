@@ -915,6 +915,17 @@ class RoutedExperts(PluggableLayer):
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
                 param = getattr(self, param_name, None)
+                if param is None and param_name.endswith("weight.weight_scale"):
+                    # Quantized fused-expert checkpoints (compressed-tensors)
+                    # name per-channel scale params w13_weight_scale /
+                    # w2_weight_scale; the checkpoint key fuses the projection
+                    # into "gate_up_proj.weight_scale", which the parameter
+                    # replacement above maps to the dotted form. Retry with the
+                    # actual flat parameter name.
+                    alt = param_name[: -len("weight.weight_scale")] + "weight_scale"
+                    param = getattr(self, alt, None)
+                    if param is not None:
+                        param_name = alt
                 if param is None:
                     if param_name.endswith(("w13_bias", "w2_bias")):
                         continue

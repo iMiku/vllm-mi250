@@ -563,9 +563,21 @@ def fused_moe_kernel(
                     else:
                         accumulator = tl.dot(a, b, acc=accumulator)
                 else:
-                    accumulator += tl.dot(a, b)
+                    # gfx90a: Triton ROCm int8 tl.dot is numerically broken
+                    # (micro-benchmarked maxerr>signal). Convert to bf16 and
+                    # dot in higher precision; scales still applied below.
+                    # Weights stay int8 in memory (bandwidth win preserved).
+                    accumulator += tl.dot(
+                        a.to(compute_type), b.to(compute_type)
+                    )
         else:
-            accumulator += tl.dot(a, b)
+            # gfx90a: int8 tl.dot is numerically broken (micro-benchmarked).
+            # Some callers reach here with int8 weights even without the
+            # int8 flag; convert to compute_type for a correct, higher-
+            # precision dot (weight bytes stay int8 in memory).
+            accumulator += tl.dot(
+                a.to(compute_type), b.to(compute_type)
+            )
         if not USE_TD:
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
