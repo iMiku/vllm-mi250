@@ -10,6 +10,12 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from .prefix_prefill_partition import (
+    VERIFY_MAX_Q,
+    _verify_partition_enabled,
+    _choose_verify_partition,
+    run_partitioned_verify,
+)
 
 # Static kernels parameters
 BASE_BLOCK = 128 if current_platform.has_device_capability(80) else 64

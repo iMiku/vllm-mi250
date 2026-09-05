@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -444,6 +445,20 @@ class MoeWNA16Method(FusedMoEMethodBase):
         replace_parameter(layer, "w2_scales", w2_scales)
         layer.w13_weight = layer.w13_qweight
         layer.w2_weight = layer.w2_qweight
+
+        # 8-pack repack (env-gated, sym/zero-point-free only): same byte count,
+        # enables the gptq8 kernel path for prefill-heavy W4A16 GEMMs.
+        if os.environ.get("VLLM_W4A16_GPTQ8", "0") == "1" and not has_zp:
+            from vllm.model_executor.layers.fused_moe.wna16_repack import (
+                repack_2pack_to_8pack,
+            )
+
+            w13_qweight = repack_2pack_to_8pack(w13_qweight)
+            w2_qweight = repack_2pack_to_8pack(w2_qweight)
+            replace_parameter(layer, "w13_qweight", w13_qweight)
+            replace_parameter(layer, "w2_qweight", w2_qweight)
+            layer.w13_weight = torch.nn.Parameter(w13_qweight, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2_qweight, requires_grad=False)
 
         if has_zp:
             assert w13_qzeros is not None and w2_qzeros is not None

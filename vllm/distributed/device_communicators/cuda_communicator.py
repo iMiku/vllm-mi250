@@ -127,7 +127,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
             )
 
-        if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
+        if (use_custom_allreduce or envs.VLLM_ROCM_FORCE_QUICK_REDUCE) and self.world_size > 1 and current_platform.is_rocm():
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
             # (vLLM's or AITER's), so it is initialized for either backend.

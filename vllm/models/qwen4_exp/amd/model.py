@@ -633,17 +633,11 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        _qcfg = vllm_config.quant_config
-        print(
-            f"LMHEAD-DEBUG prefix={maybe_prefix(prefix, 'lm_head')} "
-            f"quant_config={type(_qcfg).__name__ if _qcfg else None}",
-            flush=True,
-        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
-            quant_config=_qcfg,
+            quant_config=self.quant_config,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

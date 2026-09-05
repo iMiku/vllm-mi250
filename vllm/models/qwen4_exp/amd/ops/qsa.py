@@ -114,6 +114,112 @@ def _qsa_mqa_paged_kernel(
 
 
 @triton.jit
+def _qsa_mqa_paged_tiled_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    logits_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_req,
+    stride_table_page,
+    stride_logits_row,
+    num_rows,
+    num_columns,
+    num_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    # Row-tiled indexer scoring. A tile of BLOCK_M query rows shares ONE load of
+    # the compressed keys (the kernel is L2-bandwidth bound on that load) and the
+    # per-head query.key reduction becomes an MFMA tl.dot. Correct only when all
+    # rows in the tile share one request (page table is per-request); the wrapper
+    # routes uniform-request (prefill) calls here and falls back otherwise.
+    rt = tl.program_id(0)
+    ct = tl.program_id(1)
+    row_ids = rt * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_ids = ct * BLOCK_N + tl.arange(0, BLOCK_N)
+    dims = tl.arange(0, BLOCK_D)
+    row_ok = row_ids < num_rows
+
+    request = tl.load(token_to_req_ptr + row_ids, mask=row_ok, other=-1)
+    safe_req = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    qpos = tl.load(query_positions_ptr + row_ids, mask=row_ok, other=0)
+    req_ok = row_ok & (request >= 0) & (request < num_requests)
+    seqlen = tl.load(sequence_lengths_ptr + safe_req, mask=req_ok, other=0)
+    visible = tl.minimum(
+        (qpos + 1) // COMPRESS_RATIO, seqlen // COMPRESS_RATIO
+    )
+    if ct == 0:
+        tl.store(visible_blocks_ptr + row_ids, visible, mask=row_ok)
+
+    # Uniform request across the tile (guaranteed by the wrapper): one page table.
+    tile_req = tl.maximum(tl.max(tl.where(row_ok, safe_req, 0)), 0)
+    logical_page = col_ids // PAGE_SIZE
+    page_offset = col_ids % PAGE_SIZE
+    col_ok = (col_ids < num_columns) & (logical_page < PAGE_TABLE_WIDTH)
+    safe_lp = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr + tile_req * stride_table_req + safe_lp * stride_table_page,
+        mask=col_ok,
+        other=-1,
+    )
+    col_ok &= (physical_page >= 0) & (physical_page < num_pages)
+    safe_pp = tl.maximum(physical_page, 0).to(tl.int64)
+
+    # keys transposed to [BLOCK_D, BLOCK_N] so tl.dot contracts over the head dim.
+    keys_t = tl.load(
+        k_cache_ptr
+        + safe_pp[None, :] * stride_cache_block
+        + page_offset[None, :] * stride_cache_token
+        + dims[:, None] * stride_cache_dim,
+        mask=(dims[:, None] < HEAD_DIM) & col_ok[None, :],
+        other=0.0,
+    )
+    scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for head in tl.static_range(0, NUM_HEADS):
+        qh = tl.load(
+            q_ptr
+            + row_ids[:, None] * stride_q_row
+            + head * stride_q_head
+            + dims[None, :] * stride_q_dim,
+            mask=row_ok[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        dot = tl.dot(qh, keys_t, out_dtype=tl.float32)
+        scores += tl.maximum(dot, 0.0)
+    scores /= score_divisor
+
+    valid = (
+        row_ok[:, None]
+        & col_ok[None, :]
+        & (col_ids[None, :] < visible[:, None])
+        & (request[:, None] >= 0)
+    )
+    tl.store(
+        logits_ptr + row_ids[:, None] * stride_logits_row + col_ids[None, :],
+        tl.where(valid, scores, -float("inf")),
+        mask=row_ok[:, None] & (col_ids[None, :] < num_columns),
+    )
+
+
+@triton.jit
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -195,6 +301,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -203,6 +311,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_ks_block,
+    stride_ks_token,
+    stride_ks_head,
+    stride_vs_block,
+    stride_vs_token,
+    stride_vs_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -220,6 +334,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_INT8: tl.constexpr,
+    INT8_QK: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -239,6 +355,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         mask=head_offsets[:, None] < GROUP_SIZE,
         other=0.0,
     )
+
+    if IS_INT8 and INT8_QK:
+        # Symmetric per-row int8 quant of the query, once. Keys stay int8 in
+        # the cache, so QK^T runs directly on the int8 MFMA units (~1.3x bf16
+        # on gfx90a) and the per-key dequant is skipped.
+        q_absmax = tl.max(tl.abs(query), axis=1).to(tl.float32)
+        q_scale = tl.maximum(q_absmax * (1.0 / 127.0), 1e-6)
+        q_scaled = query / q_scale[:, None]
+        q_i8 = (q_scaled + tl.where(q_scaled >= 0, 0.5, -0.5)).to(tl.int8)
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -292,7 +417,36 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        scores = tl.dot(query, keys)
+        if IS_INT8:
+            # int8_per_token_head: one f32 scale per (token, head).
+            k_scale = tl.load(
+                k_scale_ptr
+                + safe_page * stride_ks_block
+                + page_offset * stride_ks_token
+                + kv_head * stride_ks_head,
+                mask=valid,
+                other=1.0,
+            )
+            v_scale = tl.load(
+                v_scale_ptr
+                + safe_page * stride_vs_block
+                + page_offset * stride_vs_token
+                + kv_head * stride_vs_head,
+                mask=valid,
+                other=1.0,
+            )
+            # V is always dequantized to BF16 for the PV matmul.
+            values = (values.to(tl.float32) * v_scale[:, None]).to(query.dtype)
+            if not INT8_QK:
+                # keys [HEAD_DIM, BLOCK_N] -> k_scale broadcasts over dim ([None, :]).
+                keys = (keys.to(tl.float32) * k_scale[None, :]).to(query.dtype)
+        if IS_INT8 and INT8_QK:
+            # Direct int8 QK^T: q_i8 [BLOCK_M,HEAD_DIM] x keys_i8 [HEAD_DIM,BLOCK_N]
+            # -> int32, then apply per-row q_scale and per-column k_scale.
+            scores = tl.dot(q_i8, keys, out_dtype=tl.int32).to(tl.float32)
+            scores = scores * q_scale[:, None] * k_scale[None, :]
+        else:
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -633,6 +787,64 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
+    # Row-tiled MFMA path when rows share a request (prefill of one sequence):
+    # BLOCK_M rows reuse one compressed-key load (this kernel is L2-bandwidth
+    # bound). The uniformity check syncs the device, so only pay it at prefill
+    # scale; decode (small row counts, mixed requests) uses the per-row kernel.
+    # The uniformity check is a device->host sync (illegal during graph
+    # capture). Short-circuit the capture check BEFORE it so capture never
+    # touches bool(...); eager keeps the tiled path.
+    # Capture path: skip the device->host uniformity sync (illegal during graph
+    # capture) and assume the prefill chunk is uniform (vLLM captures with dummy
+    # single-request prefill). Eager keeps the strict uniformity check.
+    use_tiled = (
+        q.shape[0] >= 64
+        and (
+            (
+                not torch.cuda.is_current_stream_capturing()
+                and bool((token_to_req == token_to_req[0]).all())
+            )
+            or torch.cuda.is_current_stream_capturing()
+        )
+    )
+    if use_tiled:
+        block_m = 16
+        _qsa_mqa_paged_tiled_kernel[
+            (triton.cdiv(q.shape[0], block_m), triton.cdiv(columns, block_n))
+        ](
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible_blocks,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(0),
+            page_table.stride(1),
+            logits.stride(0),
+            q.shape[0],
+            columns,
+            k_cache.shape[0],
+            page_table.shape[0],
+            float(score_divisor),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=triton.next_power_of_2(q.shape[2]),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+        )
+        return logits, visible_blocks
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
@@ -827,8 +1039,15 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    int8_qk: bool = False,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged K/V caches (BF16, or int8_per_token_head
+    when k_scale/v_scale are provided -- int8 K/V are dequantized inline)."""
+
+    is_int8 = k_scale is not None
+    head_dim = q.shape[2]
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
@@ -842,11 +1061,18 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention cache and block table must be nonempty")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+    # int8 caches carry padded content (head_dim + scale bytes), so the K/V last
+    # dim is >= head_dim rather than equal to it.
+    if head_dim > k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
-    head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    if is_int8:
+        assert k_cache.dtype == v_cache.dtype == torch.int8
+        assert v_scale is not None
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+    else:
+        assert k_cache.dtype == v_cache.dtype == torch.bfloat16
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -906,6 +1132,10 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
+    # Dummy scale tensors when not int8: valid pointers the kernel never reads
+    # (guarded by IS_INT8=False). Their strides are inert.
+    ks = k_scale if is_int8 else k_cache
+    vs = v_scale if is_int8 else v_cache
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
@@ -917,6 +1147,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        ks,
+        vs,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -925,6 +1157,12 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        ks.stride(0),
+        ks.stride(1),
+        ks.stride(2),
+        vs.stride(0),
+        vs.stride(1),
+        vs.stride(2),
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -936,12 +1174,14 @@ def qsa_sparse_paged_attention(
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
         GROUP_SIZE=group_size,
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=head_dim,
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        IS_INT8=is_int8,
+        INT8_QK=int8_qk,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

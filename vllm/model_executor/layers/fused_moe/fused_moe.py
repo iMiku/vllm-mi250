@@ -687,6 +687,33 @@ def invoke_fused_moe_wna16_cuda_kernel(
 
 # NOTE(zyongye): we can remove all the wna16 kernel
 # once we drop off sm75 support
+
+
+def _try_run_gptq8(use_int4_w4a16, use_int8_w8a16, B_zp, mul_routed_weight,
+                    A_rows, top_k, sorted_token_ids=None):
+    """Dispatch: gptq8 kernel for prefill-sized w13 batches only.
+
+    Prefill runs eager in vLLM (CUDA graphs cover decode only), so routing
+    big-M MoE here avoids both the graph-capture hazards and the decode cost.
+    w2 segment always stays on the production kernel (8-pack is slower there
+    for K=80).
+    """
+    if os.environ.get("VLLM_W4A16_GPTQ8", "0") != "1":
+        return False
+    if not use_int4_w4a16 or use_int8_w8a16:
+        return False
+    if B_zp is not None:
+        return False  # 8-pack repack only implemented for the sym format
+    if mul_routed_weight:
+        return False  # w2: production kernel wins on every M
+    if A_rows * top_k < 64:
+        return False  # small batches: stay on production
+    import torch as _torch
+    if _torch.cuda.is_current_stream_capturing():
+        return False  # CUDA graph capture only ever records production kernels
+    return True
+
+
 def invoke_fused_moe_wna16_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -705,6 +732,19 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
 ):
+    if _try_run_gptq8(use_int4_w4a16, use_int8_w8a16, B_zp, mul_routed_weight,
+                       A.size(0), top_k, sorted_token_ids):
+        from vllm.model_executor.layers.fused_moe.wna16_gptq8_kernel import (
+            run_gptq8,
+        )
+
+        run_gptq8(
+            A, B, C, B_scale, topk_weights, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, mul_routed_weight, top_k, compute_type,
+            block_shape, config["BLOCK_SIZE_M"],
+            block_m=64, block_n=64, block_k=64, num_warps=4,
+        )
+        return
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0

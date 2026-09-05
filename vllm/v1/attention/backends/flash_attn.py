@@ -68,6 +68,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
+)
+from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
     should_skip_dcp_context_attention,
@@ -1227,6 +1231,59 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        # int8_per_token_head: quantize K/V and write scales into the padded
+        # layout (per-token-head packed scales; 0.13.0.dev0 base lacks this).
+        kv_quant_mode = None
+        try:
+            from vllm.v1.kv_cache_interface import get_kv_quant_mode
+            kv_quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        except Exception:
+            kv_quant_mode = None
+        if kv_quant_mode is not None and kv_quant_mode.is_per_token_head:
+            padded_hs = kv_cache.shape[-1] // 2
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                padded_hs, dim=-1)
+            # Inline per-token-head scale views (strided f32 over padded content).
+            from vllm.utils.torch_utils import get_dtype_size
+            dtype_sz = kv_cache.element_size()
+            scale_pad = get_dtype_size(torch.float32) // dtype_sz
+            hs = padded_hs - scale_pad
+            raw = kv_cache.untyped_storage()
+            base_f32 = torch.tensor(
+                [], dtype=torch.float32, device=kv_cache.device).set_(raw)
+            def to_f32_units(elements: int) -> int:
+                nbytes = elements * dtype_sz
+                assert nbytes % 4 == 0
+                return nbytes // 4
+            strides = kv_cache.stride()
+            blk_f32 = to_f32_units(strides[0])
+            head_f32 = to_f32_units(strides[1])
+            slot_f32 = to_f32_units(strides[2])
+            off_f32 = to_f32_units(kv_cache.storage_offset())
+            k_scale_cache = torch.as_strided(
+                base_f32,
+                size=(kv_cache.shape[0], kv_cache.shape[2], kv_cache.shape[1]),
+                stride=(blk_f32, slot_f32, head_f32),
+                storage_offset=off_f32 + to_f32_units(hs),
+            ).fill_(1.0)
+            v_scale_cache = torch.as_strided(
+                base_f32,
+                size=(kv_cache.shape[0], kv_cache.shape[2], kv_cache.shape[1]),
+                stride=(blk_f32, slot_f32, head_f32),
+                storage_offset=off_f32 + to_f32_units(padded_hs + hs),
+            ).fill_(1.0)
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale_cache,
+                v_scale_cache,
+                slot_mapping,
+                kv_quant_mode=kv_quant_mode,
+            )
             return
 
         # Scatter write into the KV cache using slot_mapping indices.

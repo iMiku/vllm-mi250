@@ -251,7 +251,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        import os as _os
+        if self.quant_config.use_int4_w4a16 and _os.environ.get("VLLM_W4A16_GPTQ8", "0") != "1":
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
         else:
             assert hidden_states.size(-1) == w1.size(2), (
@@ -645,11 +646,12 @@ class TritonWNA16Experts(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        import os as _os
+        if self.quant_config.use_int4_w4a16 and _os.environ.get("VLLM_W4A16_GPTQ8", "0") != "1":
             assert hidden_states.size(-1) // 2 == w1.size(2), (
                 f"Hidden size mismatch {hidden_states.size(-1) // 2} == {w1.size(2)}"
             )
-        else:
+        elif not self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) == w1.size(2), (
                 f"Hidden size mismatch {hidden_states.size(-1)} != {w1.size(2)}"
             )

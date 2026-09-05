@@ -131,6 +131,25 @@ def _maybe_promote_torch_hip_runtime() -> None:
 _maybe_promote_torch_hip_runtime()
 
 
+def _inject_aiter_gfx90a_moe_config() -> None:
+    """Borrow the gfx942 1-stage CK MoE config for gfx90a (CDNA2) until aiter
+    ships gfx90a CSV tuning. aiter's ``fused_moe_1stage_dict`` is keyed by GCN
+    arch; without this, the AiterExperts bf16/fp16 noquant MoE path fails with
+    KeyError('gfx90a') on MI250."""
+
+    try:
+        import aiter.fused_moe as _fm
+
+        _d = getattr(_fm, "fused_moe_1stage_dict", None)
+        if _d is not None and "gfx90a" not in _d and "gfx942" in _d:
+            _d["gfx90a"] = _d["gfx942"]
+    except Exception:
+        pass
+
+
+_inject_aiter_gfx90a_moe_config()
+
+
 def is_aiter_found_and_supported() -> bool:
     """Check if AITER library is available and platform supports it.
 
