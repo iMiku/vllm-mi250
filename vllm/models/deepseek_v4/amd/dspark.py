@@ -18,7 +18,7 @@ Everything else — the semi-autoregressive drafting hooks, the Markov head, the
 sliding-window context-KV insert, and the checkpoint ``mtp.*`` weight remap — is
 pure torch / Triton and shared with the nvidia implementation unchanged.
 """
-
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -59,6 +59,33 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _maybe_load_quarot_rotation(vllm_config: VllmConfig) -> torch.Tensor | None:
+    """Load the QuaRot global rotation ``G`` of a w8a8 checkpoint, if present.
+
+    The w8a8 (QuaRot) checkpoint rotates the target embed/head
+    (``embed = orig_embed @ G``, ``head = orig_head @ G``) while the draft
+    backbone (``mtp.*``, with ``main_proj`` pre-de-rotated) lives in unrotated
+    space. vLLM aliases the *rotated* target embed/head onto the draft, so the
+    draft must de-rotate on the activation side instead: ``embed_out @ G.T`` and
+    ``h @ G`` before the rotated lm_head. Same semantics as vllm-ascend's
+    ``patch_draft_quarot`` (which de-rotates weights at load time instead).
+
+    Returns a CPU float32 [hidden, hidden] orthogonal matrix, or ``None`` when
+    the checkpoint has no ``optional/quarot.safetensors`` (plain fp8 ckpt).
+    """
+    try:
+        from safetensors.torch import load_file
+        model_dir = vllm_config.model_config.model
+        qpath = os.path.join(model_dir, "optional", "quarot.safetensors")
+        if not os.path.isfile(qpath):
+            return None
+        data = load_file(qpath)
+        q: torch.Tensor = data["global_rotation"].detach().to(torch.float32)
+        return q
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -69,7 +96,13 @@ class DSparkDeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        self.num_hidden_layers = config.num_hidden_layers
+        # NOTE(w8a8 patch): draft hf_config.num_hidden_layers is 0 (forced by
+        # speculative.py), and vllm_config.model_config here is the DRAFT config,
+        # so derive the target layer count from dspark_target_layer_ids instead.
+        # Draft layers are indexed >= that count so DeepseekV4Attention computes
+        # layer_id >= num_hidden_layers -> compress_ratio=1 (plain MLA matching
+        # the mtp.* checkpoint layout) instead of layer_id 0..2 -> CSA ratios.
+        self.num_hidden_layers = max(config.dspark_target_layer_ids) + 1
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
 
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
@@ -130,8 +163,31 @@ class DSparkDeepseekV4Model(nn.Module):
         # replacing the direct nvidia tilelang kernel call.
         self.hc_head_op = HCHeadOp()
 
+        # QuaRot (w8a8) checkpoint: the aliased target embed/lm_head are rotated,
+        # the draft backbone is not. De-rotate on the activation side (see
+        # _maybe_load_quarot_rotation). None for plain fp8 checkpoints.
+        self._qrot: torch.Tensor | None = _maybe_load_quarot_rotation(vllm_config)
+        self._qrot_cache: tuple | None = None  # (device, dtype, G, G_T)
+
+    def _get_qrot(self, device: torch.device, dtype: torch.dtype):
+        """Return ``(G, G_T)`` cached on the model device/dtype, or (None, None)."""
+        if self._qrot is None:
+            return None, None
+        c = self._qrot_cache
+        if c is not None and c[0] == device and c[1] == dtype:
+            return c[2], c[3]
+        g = self._qrot.to(device=device, dtype=dtype)
+        gt = g.t().contiguous()
+        self._qrot_cache = (device, dtype, g, gt)
+        return g, gt
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        e = self.embed_tokens(input_ids)
+        _g, gt = self._get_qrot(e.device, e.dtype)
+        if gt is not None:
+            # e_rot @ G.T = e_orig (de-rotate into draft backbone space).
+            e = e @ gt
+        return e
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux hidden states)).
@@ -343,7 +399,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
-        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+        h = self.model.norm(hidden_states)
+        g, _gt = self.model._get_qrot(h.device, h.dtype)
+        if g is not None:
+            # h_orig @ G = h_rot (rotate back into the aliased target-head space).
+            h = h @ g
+        return self.logits_processor(self.lm_head, h)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
@@ -452,6 +513,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 break
             else:
                 if "attn_sink" in name:
+                    if name not in params_dict:
+                        continue
                     narrow = loaded_weight[head_start:head_end]
                     params_dict[name][: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
@@ -464,6 +527,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

@@ -733,6 +733,117 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     return x_q, x_s_packed
 
 
+# --- gfx90a fast e4m3 decode (enable_fast_fp8_dequant_gfx90a.py) ------------
+# CDNA2 has no v_cvt_pk_f32_fp8, so Triton emulates e4m3 -> fp16 in ~29 VALU
+# ops per value and the conversion, not the MFMA, dominates the kernel. The
+# bit reinterpretation below is exact for every non-NaN e4m3 byte and costs 3.
+
+
+@triton.jit
+def _gfx90a_fast_fp8_to_f16(u):
+    """Decode an e4m3fn byte to an fp16 holding exactly 2^-8 times its value."""
+    u16 = u.to(tl.uint16)
+    h = ((u16 & 0x80) << 8) | ((u16 & 0x7F) << 7)
+    return h.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def _gfx90a_fast_block_scaled_mm(
+    A, B, C, As, Bs,
+    M, N, K,
+    group_n, group_k,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    stride_As_m, stride_As_k,
+    stride_Bs_k, stride_Bs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """As _w8a8_triton_block_scaled_mm, but A and B arrive as uint8."""
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_u = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
+        b_u = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0)
+
+        a = _gfx90a_fast_fp8_to_f16(a_u)
+        b = _gfx90a_fast_fp8_to_f16(b_u)
+
+        k_start = k * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # each operand was decoded 2^-8 too small
+    c = (accumulator * 65536.0).to(C.dtype.element_ty)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+_GFX90A_FAST_FP8 = None
+
+
+def _gfx90a_fast_fp8_eligible(A, B, As, Bs, block_size):
+    """Only plain e4m3 block-scaled GEMMs on CDNA1/CDNA2 take the fast path."""
+    global _GFX90A_FAST_FP8
+    if _GFX90A_FAST_FP8 is None:
+        _GFX90A_FAST_FP8 = False
+        if current_platform.is_rocm():
+            try:
+                from vllm.platforms.rocm import on_gfx9, on_mi3xx
+
+                # MI300+ has a hardware FP8 decoder; the stock path wins there.
+                _GFX90A_FAST_FP8 = bool(on_gfx9()) and not bool(on_mi3xx())
+            except Exception:
+                _GFX90A_FAST_FP8 = False
+    if not _GFX90A_FAST_FP8:
+        return False
+
+    # The bit trick decodes e4m3fn specifically, and folds a fixed 2^16 that
+    # assumes both operands went through it.
+    if A.dtype != torch.float8_e4m3fn or B.dtype != torch.float8_e4m3fn:
+        return False
+    if As.dtype != torch.float32 or Bs.dtype != torch.float32:
+        return False
+    if list(block_size) != [128, 128]:
+        return False
+    return True
+
+
+# --- end gfx90a fast e4m3 decode -------------------------------------------
+
+
 @triton.jit
 def _w8a8_triton_block_scaled_mm(
     # Pointers to inputs and output
@@ -960,6 +1071,32 @@ def w8a8_triton_block_scaled_mm(
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
+
+    if _gfx90a_fast_fp8_eligible(A, B, As, Bs, block_size):
+        _gfx90a_fast_block_scaled_mm[grid](
+            A.view(torch.uint8),
+            B.view(torch.uint8),
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            **config,
+        )
+        return C
 
     _w8a8_triton_block_scaled_mm[grid](
         A,

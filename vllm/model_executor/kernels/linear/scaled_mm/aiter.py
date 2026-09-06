@@ -95,7 +95,9 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         )
         out_dtype = x.dtype
 
-        assert w_q.shape[0] % 16 == 0 and w_q.shape[1] % 16 == 0
+        # gfx90a: relax the 16-multiple guard -- triton gemm_a8w8 masks
+        # arbitrarily; some GDN/FFN linear shapes are not 16-aligned in TP8.
+        # assert w_q.shape[0] % 16 == 0 and w_q.shape[1] % 16 == 0
         assert out_dtype is torch.bfloat16 or out_dtype is torch.float16
         assert bias is None or bias.shape[0] == w_q.shape[1] and bias.dtype == out_dtype
 
@@ -125,8 +127,18 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         # gemm_a8w8_CK(a, b, scale_a, scale_b, bias) expects
         # a to be [M, K]
         # b to be [N, K]
-        # CutlassInt8ScaledMMLinearKernel prepare weight `w_q` in [K, N] format
-        return rocm_aiter_ops.w8a8_gemm(x_q, w_q.t(), x_s, w_s, bias, out_dtype)
+        # CutlassInt8ScaledMMLinearKernel prepare weight in [K, N] format
+        #
+        # gfx90a: the CK a8w8 GEMM runs (with default config; no gfx90a rows
+        # in a8w8_tuned_gemm.csv) and measures 1.7-4.7x over the Triton
+        # gemm_a8w8 at real 27B shapes (bench_ck_vs_triton.py, 2026-09-04).
+        # The old NOTE's "rocm_aiter_ops.w8a8_gemm routes to asm/HIP ... no
+        # gfx90a entry ... deadlocking workers" applies to the asm TUNED path
+        # (w8a8_gemm), NOT to gemm_a8w8_CK, which is a separate CK entry that
+        # does not consult that CSV. Verified numerically (rel ~2e-3 vs int32
+        # ref) and by import (aiter.gemm_a8w8_CK importable).
+        from aiter import gemm_a8w8_CK as _aiter_ck
+        return _aiter_ck(x_q, w_q.t(), x_s, w_s, bias, dtype=out_dtype)
 
 
 class AiterPreshuffledPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):

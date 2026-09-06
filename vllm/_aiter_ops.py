@@ -226,6 +226,39 @@ def if_aiter_supported(func: Callable) -> Callable:
     return wrapper
 
 
+def is_aiter_attention_supported() -> bool:
+    """Can AITER's attention kernels run here?
+
+    Deliberately broader than `is_aiter_found_and_supported`, and deliberately
+    only broader for attention. AITER's fmha_v3_fwd and pa_fwd_asm kernels are
+    hand-written gfx9 ASM and run on gfx90a once the code objects exist (see
+    enable_gfx90a_asm_paths.py); they are validated there and benchmarked in
+    benchmarks/vllm-aiter-asm-gfx90a.md.
+
+    In this tree the master check already admits CDNA2 (tuned AR/MoE kernels),
+    so this predicate matters mainly on CDNA1 (gfx908/MI210), where the
+    attention paths stay reachable while the master gate is off.
+    """
+    if current_platform.is_rocm() and IS_AITER_FOUND:
+        from vllm.platforms.rocm import on_gfx9
+
+        return on_gfx9()
+    return False
+
+
+def if_aiter_attention_supported(func: Callable) -> Callable:
+    """As `if_aiter_supported`, but keyed on attention support."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if is_aiter_attention_supported():
+            return func(*args, **kwargs)
+
+        return None
+
+    return wrapper
+
+
 def _rocm_aiter_fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1897,8 +1930,14 @@ class rocm_aiter_ops:
         return cls.is_rdna_aiter_enabled() and cls._LINEAR_ENABLED
 
     @classmethod
-    @if_aiter_supported
     def is_linear_enabled(cls) -> bool:
+        # gfx90a carve-out (configs/enable_aiter_ck_gemm_gfx90a.py): the CK
+        # a8w8 GEMM measures 1.08-1.81x over the Triton fallback on MI250.
+        # In this tree the stock decorator already admits CDNA2, so this
+        # predicate additionally unlocks it on CDNA1 (gfx908/MI210). Reuses
+        # is_aiter_attention_supported() so the carve-outs cannot drift apart.
+        if not is_aiter_attention_supported():
+            return False
         return cls._AITER_ENABLED and cls._LINEAR_ENABLED
 
     @classmethod
@@ -1975,7 +2014,7 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._MLA_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @if_aiter_attention_supported
     def is_mha_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 
@@ -1985,7 +2024,7 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._CUSTOM_ALL_REDUCE_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @if_aiter_attention_supported
     def is_shuffle_kv_cache_enabled(cls) -> bool:
         return cls._SHUFFLE_KV_CACHE_ENABLED
 

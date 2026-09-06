@@ -120,6 +120,9 @@ class DeepseekV4MLP(nn.Module):
         self._gateup_scale: torch.Tensor | None = None
 
     def prepare_gateup_preshuffle(self) -> None:
+        import os
+        if os.environ.get("VLLM_ROCM_DISABLE_BPRE_GEMM") == "1":
+            return
         # B-preshuffle the gate_up_proj weight in place (single weight).
         if not self._gateup:
             return

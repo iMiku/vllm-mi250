@@ -529,6 +529,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         return num_heads
 
     def prepare_attn_preshuffle(self) -> None:
+        import os
+        if os.environ.get("VLLM_ROCM_DISABLE_BPRE_GEMM") == "1":
+            return
         from vllm._aiter_ops import rocm_aiter_ops
 
         if not rocm_aiter_ops.is_enabled():
