@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -325,6 +326,31 @@ class RocmAttentionImpl(AttentionImpl):
                 f"heads in the layer. Sinks shape: {sinks.shape}, "
                 f"num_heads: {num_heads}."
             )
+        # llama.cpp fattn-tile ported kernel (csrc/rocm/attention_llama_fa.cu).
+        # Opt-in via VLLM_ROCM_LLAMA_FA=1; used for uniform short-query steps
+        # (pure decode qlen=1, speculative verify qlen=2/4) with bf16 KV,
+        # head_size 256, no alibi/sliding-window/sinks, and an even GQA ratio
+        # (two Q heads sharing one KV head are packed per block, like
+        # llama.cpp's ncols2=2). When TP sharding leaves an odd head count
+        # (e.g. 24 Q heads / 1 KV head per rank at TP=8), the query/output
+        # are padded by one zero head at dispatch time instead.
+        hq_pad = num_heads + (num_heads % 2)
+        self._llama_fa_pad = hq_pad - num_heads
+        self.use_llama_fa = (
+            os.environ.get("VLLM_ROCM_LLAMA_FA", "0") == "1"
+            and head_size == 256
+            and kv_cache_dtype == "auto"
+            and alibi_slopes is None
+            and sinks is None
+            and hq_pad % num_kv_heads == 0
+            and (hq_pad // num_kv_heads) % 2 == 0
+        )
+        if self.use_llama_fa:
+            logger.info_once(
+                "ROCM_ATTN: llama.cpp fattn-tile decode kernel enabled "
+                "(VLLM_ROCM_LLAMA_FA=1)."
+            )
+
 
     def _forward_encoder_attention(
         self,
@@ -454,6 +480,133 @@ class RocmAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
+        # llama.cpp fattn-tile kernel for uniform short-query steps: pure
+        # decode (qlen 1) and speculative verify (qlen 2 or 4, e.g. MTP).
+        if (
+            self.use_llama_fa
+            and max_seqlen_q in (1, 2, 4)
+            and num_actual_tokens == seqused_k.shape[0] * max_seqlen_q
+            and query.dtype == torch.bfloat16
+            and key_cache.dtype == torch.bfloat16
+            and self.sliding_window[0] < 0
+        ):
+            q = query[:num_actual_tokens]
+            out = output[:num_actual_tokens]
+            if (os.environ.get("VLLM_ROCM_LLAMA_FA_DEBUG") == "1"
+                    and not getattr(self, "_llama_fa_dbg", False)
+                    and num_actual_tokens <= 8):
+                self._llama_fa_dbg = True
+                hq = self.num_heads
+                ref = torch.zeros_like(out)
+                chunked_prefill_paged_decode(
+                    query=q,
+                    key=key[:num_actual_tokens] if key is not None else None,
+                    value=value[:num_actual_tokens]
+                    if value is not None else None,
+                    output=ref,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=block_table,
+                    query_start_loc=cu_seqlens_q,
+                    seq_lens=seqused_k,
+                    max_seq_len=max_seqlen_k,
+                    max_query_len=max_seqlen_q,
+                    k_scale=layer._k_scale,
+                    v_scale=layer._v_scale,
+                    alibi_slopes=self.alibi_slopes,
+                    sliding_window=self.sliding_window[0],
+                    sm_scale=self.scale,
+                    output_scale=output_scale,
+                    sinks=self.sinks,
+                )
+                out_padded = q.new_empty(
+                    (num_actual_tokens, (hq + 1) * self.head_size))
+                q_padded = q.new_zeros(
+                    (num_actual_tokens, hq + 1, self.head_size))
+                q_padded[:, :hq] = q
+                torch.ops._rocm_C.paged_attention_llama_fa(
+                    out_padded, q_padded, key_cache, value_cache, block_table,
+                    seqused_k, self.num_kv_heads, self.scale, max_seqlen_q)
+                mine = out_padded.view(num_actual_tokens, hq + 1,
+                                       self.head_size)[:, :hq]
+                d = (mine.float() - ref.view(num_actual_tokens, hq,
+                                             self.head_size).float()).abs()
+                bs_ = key_cache.size(3)
+                nb_ = (int(seqused_k[0]) + bs_ - 1) // bs_
+                keep_ = block_table[0][:nb_].long()
+                if not torch.isnan(q_padded).any():
+                    torch.save(
+                        {
+                            "q": q_padded.detach().cpu(),
+                            "kc": key_cache[keep_].contiguous().cpu(),
+                            "vc": value_cache[keep_].contiguous().cpu(),
+                            "bt_row": block_table[0][:nb_].cpu(),
+                            "seq_lens": seqused_k[:1].cpu(),
+                            "scale": float(self.scale),
+                            "hkv": int(self.num_kv_heads),
+                            "qlen": int(max_seqlen_q),
+                        }, f"/tmp/llamafa_dump_{os.getpid()}.pt")
+                logger.warning(
+                    "LLAMA_FA_DEBUG qlen=%d T=%d hq=%d hkv=%d "
+                    "seq_lens=%s maxdiff=%.5f ref_absmax=%.4f "
+                    "mine_absmax=%.5f q_absmax=%.4f kc=%s kc_absmax=%.4f "
+                    "bt=%s bs=%d scale=%.5f",
+                    max_seqlen_q, num_actual_tokens, hq, self.num_kv_heads,
+                    seqused_k.tolist(), d.max().item(),
+                    ref.abs().max().item(), mine.abs().max().item(),
+                    q_padded.abs().max().item(), tuple(key_cache.shape),
+                    key_cache.abs().max().item(), tuple(block_table.shape),
+                    key_cache.size(1), self.scale)
+                logger.warning("LLAMA_FA_DEBUG out_padded_ptr=%#x",
+                               out_padded.data_ptr())
+                logger.warning(
+                    "LLAMA_FA_DEBUG kc_ptr=%#x strides=%s contig=%s "
+                    "flat_at_blk13=%.5f py_b0=%d",
+                    key_cache.data_ptr(), tuple(key_cache.stride()),
+                    key_cache.is_contiguous(),
+                    key_cache.reshape(-1)[
+                        int(block_table[0][0]) * key_cache[0].numel()]
+                    .float().item(),
+                    int(block_table[0][0]))
+            if self._llama_fa_pad:
+                # Odd per-rank head count: pad one zero Q head so the kernel's
+                # 2-heads-per-block layout and even GQA ratio hold, then slice
+                # the padding back out of the result.
+                hq = self.num_heads
+                q_padded = q.new_zeros(
+                    (num_actual_tokens, hq + 1, self.head_size))
+                q_padded[:, :hq] = q
+                out_padded = q.new_empty(
+                    (num_actual_tokens, (hq + 1) * self.head_size))
+                torch.ops._rocm_C.paged_attention_llama_fa(
+                    out_padded,
+                    q_padded,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    self.num_kv_heads,
+                    self.scale,
+                    max_seqlen_q,
+                )
+                out.view(num_actual_tokens, hq, self.head_size).copy_(
+                    out_padded.view(num_actual_tokens, hq + 1,
+                                    self.head_size)[:, :hq])
+                return output
+            torch.ops._rocm_C.paged_attention_llama_fa(
+                out,
+                q,
+                key_cache,
+                value_cache,
+                block_table,
+                seqused_k,
+                self.num_kv_heads,
+                self.scale,
+                max_seqlen_q,
+            )
+            return output
+
 
         # Compute attention and update output up to `num_actual_tokens`.
         chunked_prefill_paged_decode(

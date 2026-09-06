@@ -93,6 +93,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // llama.cpp fattn-tile ported paged decode attention (decode-only).
+  rocm_ops.def(
+      "paged_attention_llama_fa(Tensor! out, Tensor query,"
+      "                Tensor key_cache, Tensor value_cache,"
+      "                Tensor block_tables, Tensor seq_lens,"
+      "                int num_kv_heads, float scale, int qlen) -> ()");
+  rocm_ops.impl("paged_attention_llama_fa", torch::kCUDA,
+                &paged_attention_llama_fa);
+
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

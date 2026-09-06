@@ -87,8 +87,8 @@ torch::stable::Tensor permute_cols(torch::stable::Tensor const& A,
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   int block_rows = div_ceil(A_2d.size(0), sms);
   permute_cols_kernel<<<sms, default_threads, 0, stream>>>(
-      reinterpret_cast<int4 const*>(A_2d.const_data_ptr()),
-      perm.const_data_ptr<int>(), reinterpret_cast<int4*>(D.mutable_data_ptr()),
+      reinterpret_cast<int4 const*>(A_2d.data_ptr()),
+      static_cast<const int*>(perm.data_ptr()), reinterpret_cast<int4*>(D.data_ptr()),
       A_2d.size(0), A_2d.size(1), block_rows);
   return D;
 }
