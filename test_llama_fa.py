@@ -16,8 +16,13 @@ def run_case(seq_lens_list, qlen, seed=0):
     L = max(seq_lens_list)
     max_blocks = (L + BS - 1) // BS
     NB = max_blocks * S + 8
-    kc = torch.randn(NB, BS, Hkv, D, dtype=torch.bfloat16, device=dev, generator=g)
-    vc = torch.randn(NB, BS, Hkv, D, dtype=torch.bfloat16, device=dev, generator=g)
+    kc_flat = torch.randn(NB, BS, Hkv, D, dtype=torch.bfloat16, device=dev, generator=g)
+    vc_flat = torch.randn(NB, BS, Hkv, D, dtype=torch.bfloat16, device=dev, generator=g)
+    # op contract (csrc/rocm/attention_llama_fa.cu):
+    #   key_cache   [nb, hkv, D/8, bs, 8]  (head_dim split into 8-wide groups)
+    #   value_cache [nb, hkv, D, bs]
+    kc = kc_flat.reshape(NB, BS, Hkv, D // 8, 8).permute(0, 2, 3, 1, 4).contiguous()
+    vc = vc_flat.permute(0, 2, 3, 1).contiguous()
     q = torch.randn(S * qlen, Hq, D, dtype=torch.bfloat16, device=dev, generator=g)
     bt = torch.zeros(S, max_blocks, dtype=torch.int32, device=dev)
     for s in range(S):
@@ -36,8 +41,8 @@ def run_case(seq_lens_list, qlen, seed=0):
         n = seq_lens_list[s]
         idx = torch.arange(n, device=dev)
         blk = bt[s].long()
-        K = kc[blk[idx // BS], idx % BS].float().repeat_interleave(GQA, dim=1)
-        V = vc[blk[idx // BS], idx % BS].float().repeat_interleave(GQA, dim=1)
+        K = kc_flat[blk[idx // BS], idx % BS].float().repeat_interleave(GQA, dim=1)
+        V = vc_flat[blk[idx // BS], idx % BS].float().repeat_interleave(GQA, dim=1)
         for j in range(qlen):
             lim = n - qlen + j + 1
             att = torch.softmax(
