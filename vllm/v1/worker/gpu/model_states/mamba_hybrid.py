@@ -119,7 +119,8 @@ class MambaHybridModelState(DefaultModelState):
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1)
+                // (self.cache_config.mamba_block_size or self.cache_config.block_size)
             )
 
     def _get_mamba_group_info(

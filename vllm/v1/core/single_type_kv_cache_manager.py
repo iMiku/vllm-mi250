@@ -1517,6 +1517,15 @@ class MambaManager(SingleTypeKVCacheManager):
         for boundary_tokens in reachable_boundaries:
             aligned = boundary_tokens // alignment_tokens * alignment_tokens
             boundary_block = aligned // block_size - 1
+            if use_eagle:
+                # Match the split's one-block eagle backoff: with eagle-family
+                # spec decode the FA hit is pruned by one block, so the last
+                # servable mamba state ends one block before the replay
+                # boundary. Without this shift the retained boundary state is
+                # never materialized (the split never ends a chunk there) while
+                # the materialized state one block earlier is masked out, so
+                # prefill never registers any mamba hash.
+                boundary_block -= 1
             if start_block <= boundary_block < end_block:
                 mask[boundary_block - start_block] = True
 
