@@ -808,7 +808,8 @@ def qsa_mqa_paged(
         )
     )
     if use_tiled:
-        block_m = 16
+        block_m = 64
+        block_n = 64
         _qsa_mqa_paged_tiled_kernel[
             (triton.cdiv(q.shape[0], block_m), triton.cdiv(columns, block_n))
         ](
@@ -843,6 +844,7 @@ def qsa_mqa_paged(
             BLOCK_D=triton.next_power_of_2(q.shape[2]),
             COMPRESS_RATIO=compress_ratio,
             num_warps=4,
+            num_stages=2,
         )
         return logits, visible_blocks
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
@@ -1106,7 +1108,7 @@ def qsa_sparse_paged_attention(
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+        block_n, target_splits, partial_warps = 32, 1, 8
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
