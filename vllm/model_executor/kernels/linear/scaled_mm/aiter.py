@@ -3,6 +3,7 @@
 
 
 import torch
+from typing import Optional
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import (
@@ -30,6 +31,36 @@ from .ScaledMMLinearKernel import (
 )
 
 logger = init_logger(__name__)
+
+
+
+
+@torch.library.custom_op("vllm::aiter_gemm_a8w8_ck", mutates_args=())
+def aiter_gemm_a8w8_ck(
+    x_q: torch.Tensor,
+    w_q_t: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    from aiter import gemm_a8w8_CK
+
+    return gemm_a8w8_CK(x_q, w_q_t, x_s, w_s, bias, dtype=out_dtype)
+
+
+@aiter_gemm_a8w8_ck.register_fake
+def _(
+    x_q: torch.Tensor,
+    w_q_t: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty(
+        (x_q.shape[0], w_q_t.shape[0]), dtype=out_dtype, device=x_q.device
+    )
 
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -137,8 +168,9 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         # (w8a8_gemm), NOT to gemm_a8w8_CK, which is a separate CK entry that
         # does not consult that CSV. Verified numerically (rel ~2e-3 vs int32
         # ref) and by import (aiter.gemm_a8w8_CK importable).
-        from aiter import gemm_a8w8_CK as _aiter_ck
-        return _aiter_ck(x_q, w_q.t(), x_s, w_s, bias, dtype=out_dtype)
+        return torch.ops.vllm.aiter_gemm_a8w8_ck(
+            x_q, w_q.t(), x_s, w_s, bias, out_dtype
+        )
 
 
 class AiterPreshuffledPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
