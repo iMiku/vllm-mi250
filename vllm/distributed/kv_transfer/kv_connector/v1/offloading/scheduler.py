@@ -318,6 +318,15 @@ class SchedulerOffloadConfig(NamedTuple):
 class RequestGroupState:
     offload_keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
+    # Chunk-boundary state slots for recurrent groups (MambaSpec align).
+    # The scheduler's per-step block append for these groups interleaves
+    # chunk-boundary states with partial-state refreshes, so raw list
+    # positions do not map to offload chunks. We keep only the boundary
+    # entries: per step, the first (boundaries crossed) entries of the
+    # append are the new boundary states (the append is token-ordered and
+    # the partial refresh, if any, comes last). Chunk k's source block is
+    # then boundary_block_ids[k].
+    boundary_block_ids: list[int] = field(default_factory=list)
     # Index of the next chunk to offload.
     next_stored_chunk_idx: int = 0
     # Number of offloaded chunks hit (including GPU prefix cache)
@@ -787,6 +796,17 @@ class OffloadingConnectorScheduler:
                     )
 
                 num_chunks = min(cdiv(query_max, tokens_per_chunk), len(offload_keys))
+                if group_config.requires_cow_source:
+                    # Recurrent (mamba align) pools allocate boundary slots
+                    # lazily per scheduling step: at load time only the
+                    # locally computed chunks plus the running state slot
+                    # exist as load destinations. Cap the lookup window so
+                    # the scheduled external tokens never exceed what can
+                    # be loaded without divergent recurrent states.
+                    max_dst_chunks = (
+                        num_computed_tokens // tokens_per_chunk + 1
+                    )
+                    num_chunks = min(num_chunks, max_dst_chunks)
                 start_chunk_idx = num_computed_tokens // tokens_per_chunk
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
 
@@ -1044,6 +1064,20 @@ class OffloadingConnectorScheduler:
             offload_keys = group_state.offload_keys
             num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
+            if group_config.requires_cow_source:
+                # Recurrent (mamba align) pools allocate boundary slots
+                # lazily per scheduling step, so at alloc time only the
+                # running state slot exists. Cap the loadable window to
+                # the slots actually allocated; chunks beyond it are
+                # re-prefilled by the consumer (correct, just slower).
+                # A full multi-chunk mamba load needs core-side
+                # pre-allocation of boundary slots for the loaded range.
+                if len(group_blocks) < num_gpu_blocks:
+                    num_gpu_blocks = len(group_blocks)
+                    num_cached_tokens = min(
+                        num_cached_tokens,
+                        num_gpu_blocks * tokens_per_block,
+                    )
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
             # Skip null placeholder blocks (used for sliding window or mamba padding).
@@ -1138,6 +1172,7 @@ class OffloadingConnectorScheduler:
             if preempted:
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
+                    group_state.boundary_block_ids.clear()
 
             if new_block_id_groups:
                 if self._sliding_window_groups:
@@ -1150,6 +1185,31 @@ class OffloadingConnectorScheduler:
                     for bid in new_blocks:
                         if bid != 0:
                             self._current_batch_allocated_block_ids.add(bid)
+                # Track chunk-boundary slots for recurrent (mamba align)
+                # groups: the step's append carries the newly crossed
+                # boundary states first, then an optional partial-state
+                # refresh. Delta = boundaries crossed by this step.
+                scheduled = scheduler_output.num_scheduled_tokens.get(
+                    req_id, 0
+                )
+                before = req_status.req.num_computed_tokens
+                for gidx, group_config in enumerate(
+                    self.config.kv_group_configs
+                ):
+                    if not group_config.requires_cow_source:
+                        continue
+                    tpc = group_config.tokens_per_chunk
+                    delta = (
+                        (before + scheduled) // tpc - before // tpc
+                    )
+                    group_state = req_status.group_states[gidx]
+                    new_blocks = new_block_id_groups[gidx]
+                    if delta > 0 and new_blocks:
+                        group_state.boundary_block_ids.extend(
+                            new_blocks[:delta]
+                        )
+                    elif delta == 0 and preempted:
+                        group_state.boundary_block_ids.clear()
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks
@@ -1312,17 +1372,31 @@ class OffloadingConnectorScheduler:
                 # this selects GPU blocks 6 4 8.
                 # A block_id of 0 means either a sliding window / SSM skip
                 # or a stale entry that was zeroed out — skip it either way.
-                offload_block_ids = group_state.block_ids[
-                    start_chunk_idx * blocks_per_chunk
-                    + blocks_per_chunk
-                    - 1 : num_chunks * blocks_per_chunk : blocks_per_chunk
-                ]
+                if group_config.requires_cow_source:
+                    # Recurrent groups: chunk-boundary state slots (the raw
+                    # block_ids list interleaves partial-state refreshes).
+                    offload_block_ids = group_state.boundary_block_ids[
+                        start_chunk_idx:num_chunks
+                    ]
+                    if len(offload_block_ids) < len(offload_keys):
+                        offload_block_ids = list(offload_block_ids) + [
+                            -1
+                        ] * (len(offload_keys) - len(offload_block_ids))
+                else:
+                    offload_block_ids = group_state.block_ids[
+                        start_chunk_idx * blocks_per_chunk
+                        + blocks_per_chunk
+                        - 1 : num_chunks * blocks_per_chunk : blocks_per_chunk
+                    ]
                 assert len(offload_keys) == len(offload_block_ids)
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
-                    if block_id == 0:
+                    if group_config.requires_cow_source:
+                        if block_id < 0:  # -1 = boundary slot missing
+                            continue
+                    elif block_id == 0:
                         continue
                     # Skip SWA chunks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
@@ -1393,18 +1467,36 @@ class OffloadingConnectorScheduler:
                     )
 
                     gpu_block_idx = chunk_idx * blocks_per_chunk
-                    for i in range(blocks_per_chunk):
-                        block_id = block_ids[gpu_block_idx + i]
-                        if block_id == 0:
+                    if group_config.requires_cow_source:
+                        # Recurrent groups: one boundary state slot per
+                        # chunk; the raw block table indexes steps, not
+                        # chunks, so read the tracked boundary list.
+                        if chunk_idx < len(group_state.boundary_block_ids):
+                            block_id = group_state.boundary_block_ids[
+                                chunk_idx
+                            ]
+                        else:
+                            block_id = -1
+                        if block_id < 0:
                             continue
                         if start_gpu_block_idx is None:
-                            start_gpu_block_idx = gpu_block_idx + i
+                            start_gpu_block_idx = gpu_block_idx
                         src_block_ids.append(block_id)
                         num_group_blocks += 1
-                        if is_sliding_window:
-                            fenced_block_ids.append(block_id)
-                        else:
-                            deferred_fence_block_ids.append(block_id)
+                        deferred_fence_block_ids.append(block_id)
+                    else:
+                        for i in range(blocks_per_chunk):
+                            block_id = block_ids[gpu_block_idx + i]
+                            if block_id == 0:
+                                continue
+                            if start_gpu_block_idx is None:
+                                start_gpu_block_idx = gpu_block_idx + i
+                            src_block_ids.append(block_id)
+                            num_group_blocks += 1
+                            if is_sliding_window:
+                                fenced_block_ids.append(block_id)
+                            else:
+                                deferred_fence_block_ids.append(block_id)
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
