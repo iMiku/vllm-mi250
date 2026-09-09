@@ -49,8 +49,28 @@ def aiter_gemm_a8w8_ck(
     # tiny; fall back to dequantized bf16 matmul instead of crashing.
     n = w_q_t.shape[0]
     if n < 16 or n % 16 != 0:
-        x_dq = x_q.to(out_dtype) * x_s.unsqueeze(-1)
-        w_dq = w_q_t.to(out_dtype) * w_s.unsqueeze(-1)
+        # CK int8 instances have no tile for this shape; do a dequantized
+        # bf16 matmul. Scale layouts follow the CK convention: per-token
+        # x_s may arrive 1-D (M,) or 2-D (M, 1); per-channel w_s as (N,)
+        # or (N, 1); scalar stays scalar.
+        if x_s.numel() == 1:
+            x_s = x_s.reshape(())
+        elif x_s.numel() == x_q.shape[0]:
+            x_s = x_s.reshape(-1)
+        else:
+            raise RuntimeError('unexpected x_s layout ' + str(tuple(x_s.shape)) + ' for x ' + str(tuple(x_q.shape)))
+        if w_s.numel() == 1:
+            w_s = w_s.reshape(())
+        elif w_s.numel() == n:
+            w_s = w_s.reshape(-1)
+        else:
+            raise RuntimeError('unexpected w_s layout ' + str(tuple(w_s.shape)) + ' for w ' + str(tuple(w_q_t.shape)))
+        xs = x_s.to(out_dtype)
+        xs = xs[:, None] if xs.dim() == 1 else xs
+        ws = w_s.to(out_dtype)
+        ws = ws[:, None] if ws.dim() == 1 else ws
+        x_dq = x_q.to(out_dtype) * xs
+        w_dq = w_q_t.to(out_dtype) * ws
         out = torch.mm(x_dq, w_dq.t())
         if bias is not None:
             out = out + bias
