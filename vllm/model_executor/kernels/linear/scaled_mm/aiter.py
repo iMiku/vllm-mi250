@@ -44,6 +44,18 @@ def aiter_gemm_a8w8_ck(
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # TP8 shards some projections below the CK int8 instances' minimum N
+    # block (e.g. 96-out / 8 = 12): CK has no tile for it. Those GEMMs are
+    # tiny; fall back to dequantized bf16 matmul instead of crashing.
+    n = w_q_t.shape[0]
+    if n < 16 or n % 16 != 0:
+        x_dq = x_q.to(out_dtype) * x_s.unsqueeze(-1)
+        w_dq = w_q_t.to(out_dtype) * w_s.unsqueeze(-1)
+        out = torch.mm(x_dq, w_dq.t())
+        if bias is not None:
+            out = out + bias
+        return out
+
     from aiter import gemm_a8w8_CK
 
     return gemm_a8w8_CK(x_q, w_q_t, x_s, w_s, bias, dtype=out_dtype)
