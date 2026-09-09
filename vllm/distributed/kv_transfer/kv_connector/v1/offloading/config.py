@@ -1,3 +1,5 @@
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Translate vLLM KV cache metadata for native offloading backends."""
@@ -51,10 +53,23 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    logger.info(
+        "offload groups raw: %s; tokens_per_hash=%s",
+        [
+            (
+                type(g.kv_cache_spec).__name__,
+                g.kv_cache_spec.block_size,
+                getattr(g.kv_cache_spec, "mamba_cache_mode", None),
+                getattr(g.kv_cache_spec, "prefix_cacheable", None),
+            )
+            for g in kv_cache_config.kv_cache_groups
+        ],
+        tokens_per_hash,
+    )
     for group in groups:
-        assert group.tokens_per_block % tokens_per_hash == 0, (
-            f"tokens_per_block={group.tokens_per_block} not divisible by "
-            f"tokens_per_hash={tokens_per_hash}. "
+        assert tokens_per_hash % group.tokens_per_block == 0, (
+            f"tokens_per_hash={tokens_per_hash} not divisible by "
+            f"tokens_per_block={group.tokens_per_block}. "
             f"Hybrid models (e.g. Mamba+Attention) need "
             f"--enable-prefix-caching to align block sizes."
         )
@@ -78,17 +93,14 @@ def build_offloading_config(
     elif tokens_per_chunk is not None:
         tokens_per_chunk_int = int(tokens_per_chunk)
 
-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
-
-        assert len(unique_tokens_per_block) == 1, (
-            "If 'block_size' is specified in kv_connector_extra_config, "
-            "there must be at least one KV cache group, "
-            "and all groups must have the same block size."
+        tokens_per_block_max = max(
+            group.tokens_per_block for group in groups
         )
-
-        tokens_per_block = unique_tokens_per_block.pop()
-        assert tokens_per_chunk_int % tokens_per_block == 0
-        blocks_per_chunk = tokens_per_chunk_int // tokens_per_block
+        assert tokens_per_chunk_int % tokens_per_block_max == 0, (
+            f"block_size={tokens_per_chunk_int} not divisible by "
+            f"max tokens_per_block={tokens_per_block_max}"
+        )
+        blocks_per_chunk = tokens_per_chunk_int // tokens_per_block_max
 
     worker_kv_bytes_per_block = 0
     if kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:

@@ -32,6 +32,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
@@ -104,6 +105,14 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # Participation mask: False for caches that are never offloaded because
+    # they only hold transient rows (e.g. the QSA compression key-ring)
+    # which the consumer rebuilds when it re-prefills the tail chunk.
+    # Excluded from key generation, store scheduling and prefix lookup.
+    # Kept in all group lists so group_idx stays aligned with
+    # kv_cache_config.kv_cache_groups (OffloadKey and canonical mapping
+    # depend on the raw position).
+    is_offloadable: bool = True
 
 
 def get_sliding_window_size_in_chunks(
@@ -122,7 +131,9 @@ def get_sliding_window_size_in_chunks(
         # Mamba depends on a single state
         return 1
 
-    assert isinstance(kv_cache_spec, FullAttentionSpec)
+    if not isinstance(kv_cache_spec, FullAttentionSpec):
+        return None
+
     return None
 
 
@@ -264,6 +275,10 @@ class SchedulerOffloadConfig(NamedTuple):
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
                     ),
+                    is_offloadable=(
+                        not isinstance(kv_spec, CircularBufferSpec)
+                        and getattr(kv_spec, "prefix_cacheable", True)
+                    ),
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
@@ -357,6 +372,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.is_offloadable:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -398,6 +415,8 @@ class RequestOffloadState:
         ``next_stored_chunk_idx``, so it is never re-considered and a
         permanent hole breaks prefix-reuse lookup.
         """
+        if not group_config.is_offloadable:
+            return 0
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         if group_config.is_eagle_group and is_decoding:
@@ -504,6 +523,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not group_config.is_offloadable:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
