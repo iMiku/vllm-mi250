@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -14,6 +15,11 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+# R1 experiment gate: hoist logical-token -> (physical_page, page_offset)
+# resolution out of the attention kernel's serial tile loop. Default off, so the
+# shipped path stays bit-identical to the committed baseline.
+_QSA_RESOLVED_INDICES = os.environ.get("QSA_RESOLVED_INDICES", "0") == "1"
 
 
 @triton.jit
@@ -291,6 +297,76 @@ def _expand_qsa_indices_kernel(
 
 
 @triton.jit
+def _qsa_resolve_pages_kernel(
+    indices_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    physical_ptr,
+    offset_ptr,
+    stride_indices_row,
+    stride_table_req,
+    stride_physical_row,
+    stride_offset_row,
+    num_cache_blocks,
+    num_requests,
+    TOPK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    """Hoist logical-token -> (physical_page, page_offset) out of the serial
+    tile loop of the sparse attention kernel.
+
+    The arithmetic is identical to the inline path (including the
+    ``safe_token = max(logical_token, 0)`` clamp that yields offset 0 for
+    invalid columns). Invalid columns are canonicalised to ``physical_page = -1,
+    offset = 0`` so the consumer can decide validity with one comparison.
+
+    Storing a flat cache slot instead would be wrong on the int8 path: the K/V
+    views come from ``kv_cache.transpose(1, 2)``, so
+    ``stride_k_block == nkv * PAGE_SIZE * stride_k_token`` and the flat
+    ``slot * stride_token`` idiom only holds when ``nkv == 1``.
+    """
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    logical_token = tl.load(
+        indices_ptr + row * stride_indices_row + columns,
+        mask=columns < TOPK,
+        other=-1,
+    )
+    safe_token = tl.maximum(logical_token, 0)
+    logical_page = safe_token // PAGE_SIZE
+    page_offset = safe_token % PAGE_SIZE
+    valid = (
+        (columns < TOPK)
+        & (request >= 0)
+        & (request < num_requests)
+        & (logical_token >= 0)
+        & (logical_page < PAGE_TABLE_WIDTH)
+    )
+    physical_page = tl.load(
+        block_table_ptr
+        + safe_request * stride_table_req
+        + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+        mask=valid,
+        other=-1,
+    )
+    valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+    tl.store(
+        physical_ptr + row * stride_physical_row + columns,
+        tl.where(valid, physical_page, -1),
+        mask=columns < TOPK,
+    )
+    tl.store(
+        offset_ptr + row * stride_offset_row + columns,
+        tl.where(valid, page_offset, 0),
+        mask=columns < TOPK,
+    )
+
+
+@triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -301,6 +377,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    physical_ptr,
+    offset_ptr,
     k_scale_ptr,
     v_scale_ptr,
     stride_q_row,
@@ -319,6 +397,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_vs_head,
     stride_indices_row,
     stride_table_req,
+    stride_physical_row,
+    stride_offset_row,
     stride_output_row,
     stride_output_head,
     num_rows,
@@ -336,6 +416,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_N: tl.constexpr,
     IS_INT8: tl.constexpr,
     INT8_QK: tl.constexpr,
+    RESOLVED: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -375,28 +456,44 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
     for tile in range(split_tile_start, split_tile_end):
         columns = tile * BLOCK_N + column_offsets
-        logical_token = tl.load(
-            indices_ptr + row * stride_indices_row + columns,
-            mask=columns < TOPK,
-            other=-1,
-        )
-        safe_token = tl.maximum(logical_token, 0)
-        logical_page = safe_token // PAGE_SIZE
-        page_offset = safe_token % PAGE_SIZE
-        valid = (
-            (request >= 0)
-            & (request < num_requests)
-            & (logical_token >= 0)
-            & (logical_page < PAGE_TABLE_WIDTH)
-        )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
-        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+        if RESOLVED:
+            # Pre-resolved pages; invalid columns carry physical_page = -1, so
+            # validity is a single comparison and the block-table load, the two
+            # integer divisions and the two clamps leave the serial loop.
+            physical_page = tl.load(
+                physical_ptr + row * stride_physical_row + columns,
+                mask=columns < TOPK,
+                other=-1,
+            )
+            page_offset = tl.load(
+                offset_ptr + row * stride_offset_row + columns,
+                mask=columns < TOPK,
+                other=0,
+            )
+            valid = physical_page >= 0
+        else:
+            logical_token = tl.load(
+                indices_ptr + row * stride_indices_row + columns,
+                mask=columns < TOPK,
+                other=-1,
+            )
+            safe_token = tl.maximum(logical_token, 0)
+            logical_page = safe_token // PAGE_SIZE
+            page_offset = safe_token % PAGE_SIZE
+            valid = (
+                (request >= 0)
+                & (request < num_requests)
+                & (logical_token >= 0)
+                & (logical_page < PAGE_TABLE_WIDTH)
+            )
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
+            )
+            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
         keys = tl.load(
@@ -1134,6 +1231,35 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
+    if _QSA_RESOLVED_INDICES:
+        resolved_pages = torch.empty_like(logical_indices)
+        resolved_offsets = torch.empty_like(logical_indices)
+        _qsa_resolve_pages_kernel[
+            (q.shape[0], triton.cdiv(logical_indices.shape[1], 256))
+        ](
+            logical_indices,
+            block_table,
+            token_to_req,
+            resolved_pages,
+            resolved_offsets,
+            logical_indices.stride(0),
+            block_table.stride(0),
+            resolved_pages.stride(0),
+            resolved_offsets.stride(0),
+            k_cache.shape[0],
+            block_table.shape[0],
+            TOPK=logical_indices.shape[1],
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            BLOCK=256,
+            num_warps=4,
+        )
+    else:
+        # Dummy tensors: valid pointers the kernel never dereferences when
+        # RESOLVED is False. Mirrors the dummy scale-tensor pattern below.
+        resolved_pages = logical_indices
+        resolved_offsets = logical_indices
+
     # Dummy scale tensors when not int8: valid pointers the kernel never reads
     # (guarded by IS_INT8=False). Their strides are inert.
     ks = k_scale if is_int8 else k_cache
@@ -1149,6 +1275,8 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        resolved_pages,
+        resolved_offsets,
         ks,
         vs,
         q.stride(0),
@@ -1167,6 +1295,8 @@ def qsa_sparse_paged_attention(
         vs.stride(2),
         logical_indices.stride(0),
         block_table.stride(0),
+        resolved_pages.stride(0),
+        resolved_offsets.stride(0),
         out.stride(0),
         out.stride(1),
         q.shape[0],
@@ -1184,6 +1314,7 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         IS_INT8=is_int8,
         INT8_QK=int8_qk,
+        RESOLVED=_QSA_RESOLVED_INDICES,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
