@@ -322,10 +322,12 @@ def _qsa_resolve_pages_kernel(
     invalid columns). Invalid columns are canonicalised to ``physical_page = -1,
     offset = 0`` so the consumer can decide validity with one comparison.
 
-    Storing a flat cache slot instead would be wrong on the int8 path: the K/V
-    views come from ``kv_cache.transpose(1, 2)``, so
-    ``stride_k_block == nkv * PAGE_SIZE * stride_k_token`` and the flat
-    ``slot * stride_token`` idiom only holds when ``nkv == 1``.
+    A flat cache slot (``physical_page * PAGE_SIZE + offset``, addressed as
+    ``slot * stride_token``) would instead need
+    ``stride_k_block == PAGE_SIZE * stride_k_token``, i.e. ``nkv == 1``. That
+    holds at TP4 (``num_kv_heads = max(1, 2 // 4)``) but not at TP1, where the
+    replicated QSA KV head keeps ``nkv == 2``. The two-int form is kept because
+    it is stride-agnostic.
     """
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
