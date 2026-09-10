@@ -19,7 +19,13 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # R1 experiment gate: hoist logical-token -> (physical_page, page_offset)
 # resolution out of the attention kernel's serial tile loop. Default off, so the
 # shipped path stays bit-identical to the committed baseline.
-_QSA_RESOLVED_INDICES = os.environ.get("QSA_RESOLVED_INDICES", "0") == "1"
+_QSA_RESOLVED_INDICES = os.environ.get("QSA_RESOLVED_INDICES", "1") == "1"
+
+# R2e: pad the dot tile to MFMA's minimum M (16). GROUP_SIZE=6 gives BLOCK_M=8,
+# which keeps every tl.dot on VALU -- the production build has zero MFMA.
+# Adopted (default on): it also drops LDS 32768 -> 8192 B/CTA and n_regs 228 -> 179,
+# which is where most of its +31% comes from.
+_QSA_BLOCK_M_PAD = os.environ.get("QSA_BLOCK_M_PAD", "1") == "1"
 
 
 @triton.jit
@@ -1192,9 +1198,13 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
-    block_m = triton.next_power_of_2(group_size)
+    block_m_raw = triton.next_power_of_2(group_size)
+    # R2e widens only the dot tile. The profile selector must keep reading the
+    # unpadded value, otherwise the (block_n, splits, warps) choice changes too
+    # and the A/B stops isolating R2e.
+    block_m = max(16, block_m_raw) if _QSA_BLOCK_M_PAD else block_m_raw
     base_programs = q.shape[0] * k_cache.shape[2]
-    small_profile_limit = 8 if block_m <= 8 else 4
+    small_profile_limit = 8 if block_m_raw <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
     # Narrow tiles favor decode; wide tiles improve throughput for prefill.
