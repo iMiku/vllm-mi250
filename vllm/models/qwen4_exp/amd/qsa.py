@@ -66,6 +66,20 @@ from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
 
+# R4b: pad each int8 K/V half (head data + inline fp32 scale) up to a 16-byte
+# boundary. That is what makes the runtime token stride 16-byte aligned and puts
+# V's base offset on a 16-byte boundary; without it the Triton KV gather is
+# pinned to 8-byte (K) / 4-byte (V) scalar loads because the dense 520-byte row
+# has stride 520 (mod 16 == 8) and V at offset 260 (mod 16 == 4). Measured on
+# mi250: QSA kernel call 20.54 ms -> 9.60 ms (+53%), buffer_load count 105 -> 30.
+# Costs 544/520 = +4.6% KV bytes. QSA_KV_ALIGN16=0 restores the dense layout.
+_QSA_KV_ALIGN16 = os.environ.get("QSA_KV_ALIGN16", "1") == "1"
+_KV_ALIGN = 16
+
+
+def _align_up(value: int, align: int) -> int:
+    return (value + align - 1) // align * align
+
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
@@ -97,7 +111,15 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         if mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             hs_k, hs_v = hs_k // 2, hs_v // 2
         scale_bytes = get_dtype_size(torch.float32)
-        content = (hs_k + hs_v) * get_dtype_size(spec.dtype) + 2 * scale_bytes
+        dtype_sz = get_dtype_size(spec.dtype)
+        if _QSA_KV_ALIGN16:
+            # R4b: pad each half separately so the token stride (== content) and
+            # V's base offset are both 16-byte aligned.
+            half_k = _align_up(hs_k * dtype_sz + scale_bytes, _KV_ALIGN)
+            half_v = _align_up(hs_v * dtype_sz + scale_bytes, _KV_ALIGN)
+            content = half_k + half_v
+        else:
+            content = (hs_k + hs_v) * dtype_sz + 2 * scale_bytes
         return replace(spec, state_content_bytes=content)
 
     @staticmethod
@@ -185,15 +207,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         kv_cache is (num_blocks, nkv, block_size, 2*(hs+pad)) with content
         [K(hs) | K_scale(pad) | V(hs) | V_scale(pad)] per (head, slot); the last
         pad int8 elements of each half hold one float32 scale. Ported from the
-        reference FlashAttention per-token-head path.
+        reference FlashAttention per-token-head path. With QSA_KV_ALIGN16 each
+        half is padded up to 16 bytes (R4b), so V starts at an aligned offset.
         """
         if self._k_scale_cache is not None:
             return
         num_blocks, nkv, block_size, content = kv_cache.shape
         dtype_sz = kv_cache.element_size()
         scale_pad = get_dtype_size(torch.float32) // dtype_sz
-        padded_hs = content // 2
-        hs = padded_hs - scale_pad
+        if _QSA_KV_ALIGN16:
+            hs = self.head_size
+            padded_hs = _align_up(hs + scale_pad, _KV_ALIGN)
+            if 2 * padded_hs != content:
+                raise ValueError(
+                    f"QSA int8 KV content {content} != 2 * padded half "
+                    f"{padded_hs} (head_size={hs}, dtype={kv_cache.dtype})"
+                )
+        else:
+            padded_hs = content // 2
+            hs = padded_hs - scale_pad
         raw = kv_cache.untyped_storage()
         base_f32 = torch.tensor(
             [], dtype=torch.float32, device=kv_cache.device
@@ -231,9 +263,20 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """int8 K/V views (num_blocks, block_size, nkv, padded_hs); ensures scales."""
         self._ensure_scale_caches(kv_cache)
-        padded_hs = kv_cache.shape[-1] // 2
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(padded_hs, dim=-1)
-        return key_cache, value_cache
+        content = kv_cache.shape[-1]
+        if _QSA_KV_ALIGN16:
+            scale_pad = get_dtype_size(torch.float32) // kv_cache.element_size()
+            padded_hs = _align_up(self.head_size + scale_pad, _KV_ALIGN)
+        else:
+            padded_hs = content // 2
+        if 2 * padded_hs != content:
+            raise ValueError(
+                f"QSA int8 KV content {content} != 2 * padded half {padded_hs}"
+            )
+        # Slicing (rather than split) keeps V's storage offset equal to
+        # padded_hs, which is what R4b aligns to 16 bytes.
+        paged = kv_cache.transpose(1, 2)
+        return paged[..., :padded_hs], paged[..., padded_hs:]
 
     def do_kv_cache_update(
         self,
