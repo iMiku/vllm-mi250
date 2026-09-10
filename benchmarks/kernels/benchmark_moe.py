@@ -101,6 +101,7 @@ def benchmark_config(
     dtype: torch.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int8_w8a8: bool = False,
     use_int4_w4a16: bool = False,
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
@@ -132,7 +133,7 @@ def benchmark_config(
             ),
             dtype=torch.uint8,
         )
-    elif use_int8_w8a16:
+    elif use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
             -127,
             127,
@@ -182,6 +183,11 @@ def benchmark_config(
             (num_experts, hidden_size, w2_num_k),
             dtype=dtype,
         )
+    elif use_int8_w8a8:
+        w1_scale = torch.randn(
+            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+        )
+        w2_scale = torch.randn((num_experts, hidden_size), dtype=torch.float32)
     elif use_int8_w8a16:
         w1_scale = torch.randn(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
@@ -229,6 +235,8 @@ def benchmark_config(
 
         if use_fp8_w8a8:
             quant_dtype = torch.float8_e4m3fn
+        elif use_int8_w8a8:
+            quant_dtype = torch.int8
         elif use_int8_w8a16:
             quant_dtype = torch.int8
         else:
@@ -236,6 +244,7 @@ def benchmark_config(
 
         quant_config = FusedMoEQuantConfig.make(
             quant_dtype=quant_dtype,
+            per_act_token_quant=use_int8_w8a8,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -608,6 +617,7 @@ class BenchmarkWorker:
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
+        use_int8_w8a8: bool = False,
     ) -> dict[str, int]:
         # local import to allow serialization by ray
         from vllm.platforms import current_platform
@@ -615,7 +625,7 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         if current_platform.is_rocm():
-            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int8_w8a8 or use_int4_w4a16)
             search_space = prune_rocm_search_space(
                 num_tokens,
                 shard_intermediate_size,
@@ -640,7 +650,8 @@ class BenchmarkWorker:
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
-                    use_int4_w4a16,
+                    use_int8_w8a8=use_int8_w8a8,
+                    use_int4_w4a16=use_int4_w4a16,
                     num_iters=20,
                     block_quant_shape=block_quant_shape,
                     use_deep_gemm=use_deep_gemm,
@@ -916,6 +927,7 @@ def main(args: argparse.Namespace):
     dtype = resolve_dtype(config)
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
+    use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
     block_quant_shape = get_weight_block_size_safety(config)
     if use_int4_w4a16:
@@ -983,7 +995,7 @@ def main(args: argparse.Namespace):
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
         # search space generation (no matrix_instr_nonkdim/kpack exploration).
-        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int8_w8a8 or use_int4_w4a16)
         # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does not
         # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
         # of group_size. Skip block_quant_shape filtering to keep the full
@@ -1018,6 +1030,7 @@ def main(args: argparse.Namespace):
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
+                    use_int8_w8a8,
                 )
                 for batch_size in batch_sizes
             ],
@@ -1078,7 +1091,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16", "int8_w8a8"],
         default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
