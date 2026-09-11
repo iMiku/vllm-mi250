@@ -27,6 +27,12 @@ _QSA_RESOLVED_INDICES = os.environ.get("QSA_RESOLVED_INDICES", "1") == "1"
 # which is where most of its +31% comes from.
 _QSA_BLOCK_M_PAD = os.environ.get("QSA_BLOCK_M_PAD", "1") == "1"
 
+# p42: clamp indexer scoring to the visible (causal) column range.
+# top_k_per_row_decode sets rowEnd = seqLens = visible_blocks, so the
+# top-k never reads columns >= visible; column tiles wholly beyond the
+# window may exit before their key load instead of scoring then masking.
+_QSA_VISIBLE_CLAMP = os.environ.get("QSA_VISIBLE_CLAMP", "0") == "1"
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -59,6 +65,7 @@ def _qsa_mqa_paged_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    CLAMP_VISIBLE: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -77,6 +84,10 @@ def _qsa_mqa_paged_kernel(
     )
     if tl.program_id(1) == 0:
         tl.store(visible_blocks_ptr + row, visible)
+    if CLAMP_VISIBLE:
+        # Tile 0 always runs so visible_blocks above is always stored.
+        if tl.program_id(1) > 0 and tl.program_id(1) * BLOCK_N >= visible:
+            return
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
     valid = (
@@ -157,6 +168,7 @@ def _qsa_mqa_paged_tiled_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    CLAMP_VISIBLE: tl.constexpr = False,
 ) -> None:
     # Row-tiled indexer scoring. A tile of BLOCK_M query rows shares ONE load of
     # the compressed keys (the kernel is L2-bandwidth bound on that load) and the
@@ -180,6 +192,10 @@ def _qsa_mqa_paged_tiled_kernel(
     )
     if ct == 0:
         tl.store(visible_blocks_ptr + row_ids, visible, mask=row_ok)
+    if CLAMP_VISIBLE:
+        # Tile 0 always runs so visible_blocks above is always stored.
+        if ct > 0 and ct * BLOCK_N >= tl.max(tl.where(row_ok, visible, 0)):
+            return
 
     # Uniform request across the tile (guaranteed by the wrapper): one page table.
     tile_req = tl.maximum(tl.max(tl.where(row_ok, safe_req, 0)), 0)
@@ -948,6 +964,7 @@ def qsa_mqa_paged(
             BLOCK_N=block_n,
             BLOCK_D=triton.next_power_of_2(q.shape[2]),
             COMPRESS_RATIO=compress_ratio,
+            CLAMP_VISIBLE=_QSA_VISIBLE_CLAMP,
             num_warps=4,
             num_stages=2,
         )
@@ -982,6 +999,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
+        CLAMP_VISIBLE=_QSA_VISIBLE_CLAMP,
         num_warps=4,
     )
     return logits, visible_blocks
