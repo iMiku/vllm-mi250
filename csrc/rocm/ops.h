@@ -52,3 +52,24 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+// llama.cpp fattn-tile ported paged decode attention (see
+// csrc/rocm/attention_llama_fa.cu). Decode-only: one query token per sequence.
+void paged_attention_llama_fa(torch::Tensor& out, torch::Tensor& query,
+                              torch::Tensor& key_cache,
+                              torch::Tensor& value_cache,
+                              torch::Tensor& block_tables,
+                              torch::Tensor& seq_lens, int64_t num_kv_heads,
+                              double scale, int64_t qlen);
+
+// int8-KV variant of the above (see csrc/rocm/attention_llama_fa_int8.cu):
+// K [nb,hkv,D/16,bs,16] int8, V [nb,hkv,D,bs] int8, per-token-head f32 scales.
+void paged_attention_llama_fa_int8(torch::Tensor& out, torch::Tensor& query,
+                                   torch::Tensor& key_cache,
+                                   torch::Tensor& value_cache,
+                                   torch::Tensor& k_scale,
+                                   torch::Tensor& v_scale,
+                                   torch::Tensor& block_tables,
+                                   torch::Tensor& seq_lens,
+                                   int64_t num_kv_heads, double scale,
+                                   int64_t qlen, int64_t max_seq_len);

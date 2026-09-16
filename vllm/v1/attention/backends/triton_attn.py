@@ -5,6 +5,9 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import os
+
+_XC = [0]
 import torch
 
 import vllm.envs as envs
@@ -641,6 +644,131 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
+        # ---- 原生 MFMA int8 内核（短 qlen：decode / MTP verify）----
+        # cache 是 packed 布局 ([K(hs)|K_scale(4)|V(hs)|V_scale(4)] per (head,slot))，
+        # 内核用 FA_INT8_LAYOUT=1 的 PACKED 模式读；scale 直接用已切好的视图。
+        if (
+            self._is_per_token_head_quant
+            and self.kv_cache_dtype == "int8_per_token_head"
+            # ⚠️ 仅 qlen==1（已验证质量 OK）。qlen 2/4 的多组内核在引擎里输出错误，
+            #    已排除：寻址（packed/dim-major 逐位等价 ✓）、因果约定（两种 qoff 都错 ✗）。
+            #    待用"同调用对拍"（我的 op vs unified_attention）定位后再放开。
+            # 结论已定：qlen 1/2/4 全走原生内核。因果约定 = "引擎 seq_lens 已含当前
+            # query 块"（draft 前向已把 draft token 的 K/V 写进 cache）=> q_off=0，
+            # 即 q_pos = seq_len - qlen + g。/tmp/fa_int8_qoff 写 '1' 可切到 seq_len+g
+            # 仅用于排查（关掉因果掩码，实测质量会退化）。
+            # qlen>=1 全走原生内核：1=64线程内核；2/4=多组(NG=4)；>4=预填
+            # （预填时 op 内强制 pb=1，靠查询 tile 共享 K/V 摊薄流量）
+            and 1 <= max_seqlen_q <= 16384
+            and self.num_heads <= 16
+            and kv_cache.shape[2] % 16 == 0   # 块大小从 cache 形状取（本实现无 block_size 属性）
+            and num_actual_tokens == seqused_k.shape[0] * max_seqlen_q
+            and os.environ.get("VLLM_ROCM_LLAMA_FA", "0") == "1"
+        ):
+            nb, nkv, bs_, content_ = kv_cache.shape
+            hs_ = self.head_size
+            s0, s1, s2 = (int(kv_cache.stride(i)) for i in range(3))
+            # ★ 必须沿用 kv_cache 自身的 storage_offset：KV 池是整块共享 storage
+            #   按层切片的，每层 offset 不同；此前用 empty(0).set_(storage) 造基张量会
+            #   把 offset 归零 => 除第 0 层外全部读到第 0 层的缓存（输出与参考正交）。
+            kv_off = int(kv_cache.storage_offset())
+            k_view = kv_cache.as_strided((nb, nkv, hs_ // 16, bs_, 16),
+                                         (s0, s1, 16, s2, 1))
+            v_view = kv_cache.as_strided((nb, nkv, hs_, bs_), (s0, s1, s2, 1),
+                                         storage_offset=kv_off + hs_ + 4)
+            _OUR = torch.empty_like(output)
+            torch.ops._rocm_C.paged_attention_llama_fa_int8(
+                _OUR[:num_actual_tokens],
+                query[:num_actual_tokens],
+                k_view,
+                v_view,
+                self._k_scale_cache,
+                self._v_scale_cache,
+                block_table,
+                seqused_k,
+                self.num_kv_heads,
+                self.scale,
+                max_seqlen_q,
+                int(max_seqlen_k),
+            )
+            # ---- 同一调用内对拍：我的 op vs unified_attention（同数据同参数）----
+            if os.environ.get("FA_INT8_XC", "0") == "1" and max_seqlen_q > 1 \
+                    and seqused_k.shape[0] <= 8 and _XC[0] < 4:
+                _XC[0] += 1
+                _REF = torch.empty_like(output)
+                unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=_REF[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    use_alibi_sqrt=self.use_alibi_sqrt,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    seq_threshold_3D=attn_metadata.seq_threshold_3D,
+                    num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+                    softmax_segm_output=attn_metadata.softmax_segm_output,
+                    softmax_segm_max=attn_metadata.softmax_segm_max,
+                    softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+                    sinks=self.sinks,
+                    output_scale=output_scale,
+                    mm_prefix_range=attn_metadata.mm_prefix_range_tensor,
+                    rswa_prefix_lens=attn_metadata.rswa_prefix_lens,
+                    rswa_window=attn_metadata.rswa_window,
+                    kv_quant_mode=self._kv_quant_mode,
+                    k_scale_cache=k_scale_cache,
+                    v_scale_cache=v_scale_cache,
+                    chunk_lookback=self.chunk_lookback,
+                    use_td=self.use_td,
+                    mm_prefix_clamp_sliding_window=getattr(
+                        layer, "mm_prefix_clamp_sliding_window", False
+                    ),
+                )
+                torch.cuda.synchronize()
+                _a = _OUR[:num_actual_tokens].float()
+                _b = _REF[:num_actual_tokens].float()
+                _d = (_a - _b).abs()
+                _scale = _b.abs().amax().clamp_min(1e-9)
+                print("[xc] qlen=%d ntok=%d nseq=%d max|d|=%.3e rel=%.3e "
+                      "|our|=%.3f |ref|=%.3f" % (
+                          max_seqlen_q, num_actual_tokens, seqused_k.shape[0],
+                          float(_d.max()), float(_d.max() / _scale),
+                          float(_a.abs().amax()), float(_b.abs().amax())), flush=True)
+                _ph = (_d.amax(dim=(0, 2)) / _b.abs().amax(dim=(0, 2)).clamp_min(1e-9))
+                print("[xc] per-head rel:", [round(float(v), 4) for v in _ph[:12]],
+                      flush=True)
+                _pg = (_d.amax(dim=(1, 2)) / _b.abs().amax(dim=(1, 2)).clamp_min(1e-9))
+                _ng = _pg.shape[0] // seqused_k.shape[0]
+                print("[xc] per-g rel(first 8):",
+                      [round(float(v), 4) for v in _pg[:8]], "ng=%d" % _ng, flush=True)
+                # 排列检验：行向量余弦。若 op 只是"行错位"，argmax 会偏离自身
+                _A = _a.reshape(num_actual_tokens, -1)
+                _B = _b.reshape(num_actual_tokens, -1)
+                _An = _A / _A.norm(dim=1, keepdim=True).clamp_min(1e-6)
+                _Bn = _B / _B.norm(dim=1, keepdim=True).clamp_min(1e-6)
+                _C = _An @ _Bn.t()          # [ntok, ntok] 余弦
+                _am = _C.argmax(dim=1)
+                _diag = _C.diag()
+                print("[xc] 行自匹配: argmax==self 的比例=%.3f  diag余弦 min=%.3f max=%.3f" % (
+                    float((_am == torch.arange(num_actual_tokens,
+                                               device=_am.device)).float().mean()),
+                    float(_diag.min()), float(_diag.max())), flush=True)
+                print("[xc] 前12行 argmax/余弦:", [
+                    (int(_am[i]), round(float(_C[i, _am[i]]), 3))
+                    for i in range(min(12, num_actual_tokens))],
+                    flush=True)
+            output.copy_(_OUR)
+            return output
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
         softmax_segm_output = attn_metadata.softmax_segm_output
