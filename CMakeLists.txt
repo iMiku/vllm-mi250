@@ -1197,6 +1197,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
   endif()
 
+  # ---- GDN 融合解码（ROCm 侧补充，镜像上面的 KDA 处理）----
+  # 上游只在 CUDA 且 CUDA>=13 时构建 csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu，
+  # 于是 gfx90a 上 `fused_gdn_decode_post_conv_mtp` 根本不存在，VLLM_GDN_DECODE_KERNEL=cuda
+  # 会直接报 "is not built"。该内核引了 cuda_compat.h（hip 化），先按原样在 HIP 下编译；
+  # 若编不过再写 *_rocm.cu 变体。
+  if(VLLM_GPU_LANG STREQUAL "HIP")
+    set(FUSED_GDN_DECODE_HIP_ARCHS ${VLLM_GPU_ARCHES})
+    list(FILTER FUSED_GDN_DECODE_HIP_ARCHS INCLUDE REGEX "gfx90a|gfx942|gfx950")
+    if(FUSED_GDN_DECODE_HIP_ARCHS)
+      set(FUSED_GDN_DECODE_HIP_SRC
+        "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu")
+      list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_GDN_DECODE_HIP_SRC}")
+      message(STATUS
+        "Building fused GDN decode for HIP archs: ${FUSED_GDN_DECODE_HIP_ARCHS}")
+    endif()
+  endif()
+
   message(STATUS "Enabling C_stable extension.")
   list(REMOVE_DUPLICATES VLLM_STABLE_EXT_SRC)
   define_extension_target(
@@ -1244,6 +1261,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(FUSED_KDA_DECODE_HIP_SRC)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_FUSED_KDA_DECODE=1)
+    endif()
+    if(FUSED_GDN_DECODE_HIP_SRC)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_FUSED_GDN_DECODE=1)
     endif()
   endif()
 

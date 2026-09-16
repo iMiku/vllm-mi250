@@ -17,19 +17,31 @@ namespace {
 template <typename StateT>
 __device__ __forceinline__ void cp_async_16b(StateT* smem_ptr,
                                              const StateT* gmem_ptr) {
+#if defined(USE_ROCM)
+  // CDNA2 无 cp.async（那是 SM80+ 的 PTX）：退回同步 16B 拷贝。
+  *reinterpret_cast<uint4*>(smem_ptr) = *reinterpret_cast<const uint4*>(gmem_ptr);
+#else
   const uint32_t smem_addr =
       static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
                :
                : "r"(smem_addr), "l"(gmem_ptr));
+#endif
 }
 
 __device__ __forceinline__ void cp_async_commit() {
+#if !defined(USE_ROCM)
   asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_wait_all() {
+#if defined(USE_ROCM)
+  // 同步拷贝无需等待，但保留一次 barrier 以匹配原语义
+  __syncthreads();
+#else
   asm volatile("cp.async.wait_all;\n" ::: "memory");
+#endif
 }
 
 template <typename StateT, int ChunkV, int DimK, int Stages>
@@ -76,10 +88,17 @@ __device__ __forceinline__ void store_state4<float>(float* state,
 template <>
 __device__ __forceinline__ void store_state4<__nv_bfloat16>(
     __nv_bfloat16* state, float4 value) {
+#if defined(USE_ROCM)
+  *reinterpret_cast<__nv_bfloat162*>(state) =
+      __float22bfloat162_rn(make_float2(value.x, value.y));
+  *reinterpret_cast<__nv_bfloat162*>(state + 2) =
+      __float22bfloat162_rn(make_float2(value.z, value.w));
+#else
   *reinterpret_cast<__nv_bfloat162*>(state) =
       __floats2bfloat162_rn(value.x, value.y);
   *reinterpret_cast<__nv_bfloat162*>(state + 2) =
       __floats2bfloat162_rn(value.z, value.w);
+#endif
 }
 
 constexpr int kDimK = 128;
@@ -128,7 +147,7 @@ __device__ __forceinline__ float load_dt_bias(const void* dt_bias, int head,
 __device__ __forceinline__ float warp_reduce_sum(float value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    value += __shfl_xor_sync(0xffffffffu, value, offset);
+    value += __shfl_xor_sync(0xffffffffffffffffULL, value, offset);
   }
   return value;
 }
@@ -141,8 +160,8 @@ struct Sum2 {
 __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    x += __shfl_xor_sync(0xffffffffu, x, offset);
-    y += __shfl_xor_sync(0xffffffffu, y, offset);
+    x += __shfl_xor_sync(0xffffffffffffffffULL, x, offset);
+    y += __shfl_xor_sync(0xffffffffffffffffULL, y, offset);
   }
   return {x, y};
 }
@@ -224,9 +243,9 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
     }
     const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
     const float q_scale = __shfl_sync(
-        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
+        0xffffffffffffffffULL, lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
     const float k_scale = __shfl_sync(
-        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
+        0xffffffffffffffffULL, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int dim = lane + i * 32;
