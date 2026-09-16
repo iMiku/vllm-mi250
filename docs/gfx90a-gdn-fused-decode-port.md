@@ -41,3 +41,24 @@ present, the reference test was present, and only a CMake branch plus three HIP-
 lines stood between the card and the kernel. The same shape of exclusion produced the
 earlier AITER findings (`on_mi3xx()` as the single upstream predicate), so the check to
 run first is always *what gated the build or the registration*, not *what the ISA allows*.
+
+## Outcome: the port is correct but worth ~0% (measured)
+
+After the op existed and `VLLM_GDN_DECODE_KERNEL=cuda` was accepted (the engine logs
+`GDN decode kernel: cuda`), a like-for-like measurement gave:
+
+| | before (triton decode) | after (fused decode) |
+|---|---|---|
+| decode @9k, 500 tokens | 76.4 tok/s | **77.1 tok/s** (+0.9%, inside noise) |
+| prefill @2k | 1665 tok/s | 1651 tok/s (flat) |
+| quality | correct | correct |
+
+**So GDN is not the bottleneck**, and the earlier inference "the per-token-scaling part of
+decode must be GDN" was wrong — the roofline decomposition only ever excluded *weight
+bandwidth*; naming a module from it was a guess. GDN decode is a small per-layer state
+update (48 layers x ~1.5 MB of state ~ 72 MB/step ~ 60 us at 1.2 TB/s): neither
+bandwidth-bound nor many kernels, so fusing it could not pay.
+
+Keep the port (it is correct and costs nothing), but do not expect a speedup from it, and
+do not spend further effort on the GDN path: CuteDSL's GDN is hard-gated to Blackwell, the
+AITER GDN triton kernels are already in use, and this fused op is now enabled and measured.
